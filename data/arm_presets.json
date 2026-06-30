@@ -1,0 +1,7 @@
+{
+  "urdf_default": {
+    "label": "URDF 默认",
+    "description": "右臂 7 关节 URDF 零位 (0 rad)；与 fk_urdf 缺省 joint=0 一致",
+    "use_urdf_default": true
+  }
+}

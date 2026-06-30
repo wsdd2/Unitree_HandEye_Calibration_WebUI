@@ -1,0 +1,157 @@
+{
+  "urdf": "unitree_ros\\robots\\g1_description\\g1_29dof_rev_1_0.urdf",
+  "root_links": [
+    "pelvis"
+  ],
+  "base_link": "pelvis",
+  "missing_joint_values_defaulted_to_zero": [
+    "left_hip_pitch_joint",
+    "left_hip_roll_joint",
+    "left_hip_yaw_joint",
+    "left_knee_joint",
+    "left_ankle_pitch_joint",
+    "left_ankle_roll_joint",
+    "right_hip_pitch_joint",
+    "right_hip_roll_joint",
+    "right_hip_yaw_joint",
+    "right_knee_joint",
+    "right_ankle_pitch_joint",
+    "right_ankle_roll_joint",
+    "waist_yaw_joint",
+    "waist_roll_joint",
+    "waist_pitch_joint",
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint",
+    "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint",
+    "right_elbow_joint",
+    "right_wrist_roll_joint",
+    "right_wrist_pitch_joint",
+    "right_wrist_yaw_joint"
+  ],
+  "targets": {
+    "d435_link": {
+      "position_xyz": [
+        0.05366,
+        0.01753,
+        0.47386999999999996
+      ],
+      "orientation_quat_xyzw": [
+        0.0,
+        0.40354529635239006,
+        0.0,
+        0.9149596678498247
+      ],
+      "transform_matrix": [
+        [
+          0.6743023875837234,
+          0.0,
+          0.7384553406258838,
+          0.05366
+        ],
+        [
+          0.0,
+          1.0,
+          0.0,
+          0.01753
+        ],
+        [
+          -0.7384553406258838,
+          0.0,
+          0.6743023875837234,
+          0.47386999999999996
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "left_wrist_yaw_link": {
+      "position_xyz": [
+        0.19977428484395907,
+        0.14866170416597865,
+        0.0952328317453441
+      ],
+      "orientation_quat_xyzw": [
+        3.0002631766246175e-05,
+        2.74716260081235e-05,
+        -9.579582400921953e-05,
+        0.999999994584156
+      ],
+      "transform_matrix": [
+        [
+          0.9999999801369398,
+          0.00019159329542296684,
+          5.493750346501793e-05,
+          0.19977428484395907
+        ],
+        [
+          -0.0001915899985386503,
+          0.9999999798460044,
+          -6.001052654164285e-05,
+          0.14866170416597865
+        ],
+        [
+          -5.4948999972347896e-05,
+          5.999999987338356e-05,
+          0.9999999966903038,
+          0.0952328317453441
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    },
+    "right_wrist_yaw_link": {
+      "position_xyz": [
+        0.19977428484395907,
+        -0.14865170416597864,
+        0.0952328317453441
+      ],
+      "orientation_quat_xyzw": [
+        -3.0002631766246175e-05,
+        2.74716260081235e-05,
+        9.579582400921953e-05,
+        0.999999994584156
+      ],
+      "transform_matrix": [
+        [
+          0.9999999801369398,
+          -0.00019159329542296684,
+          5.493750346501793e-05,
+          0.19977428484395907
+        ],
+        [
+          0.0001915899985386503,
+          0.9999999798460044,
+          6.001052654164285e-05,
+          -0.14865170416597864
+        ],
+        [
+          -5.4948999972347896e-05,
+          -5.999999987338356e-05,
+          0.9999999966903038,
+          0.0952328317453441
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ]
+      ]
+    }
+  }
+}

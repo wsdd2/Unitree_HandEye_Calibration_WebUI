@@ -1,0 +1,29 @@
+{
+  "description": "Unitree G1 29DoF FK regression sample with non-zero waist and arm joints.",
+  "urdf": "..\\..\\unitree_ros\\robots\\g1_description\\g1_29dof_rev_1_0.urdf",
+  "base_link": "pelvis",
+  "targets": [
+    "d435_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link"
+  ],
+  "joints": {
+    "waist_yaw_joint": 0.12,
+    "waist_roll_joint": -0.04,
+    "waist_pitch_joint": 0.08,
+    "left_shoulder_pitch_joint": 0.35,
+    "left_shoulder_roll_joint": 0.18,
+    "left_shoulder_yaw_joint": -0.25,
+    "left_elbow_joint": 0.72,
+    "left_wrist_roll_joint": 0.15,
+    "left_wrist_pitch_joint": -0.12,
+    "left_wrist_yaw_joint": 0.2,
+    "right_shoulder_pitch_joint": 0.28,
+    "right_shoulder_roll_joint": -0.16,
+    "right_shoulder_yaw_joint": 0.22,
+    "right_elbow_joint": 0.66,
+    "right_wrist_roll_joint": -0.14,
+    "right_wrist_pitch_joint": 0.1,
+    "right_wrist_yaw_joint": -0.18
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "description": "Unitree G1 29DoF FK smoke test: all active joints default to zero.",
+  "urdf": "..\\..\\unitree_ros\\robots\\g1_description\\g1_29dof_rev_1_0.urdf",
+  "base_link": "pelvis",
+  "targets": [
+    "d435_link",
+    "left_wrist_yaw_link",
+    "right_wrist_yaw_link"
+  ],
+  "joints": {}
+}

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+outputs/
+data/*
+!data/arm_presets.json
+!data/.gitkeep
+*.log
+camera_calib_image/
+handeye_img/
+*.npy
+!robot_kinematics/example/*.json

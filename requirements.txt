@@ -1,0 +1,8 @@
+numpy
+opencv-python
+pyrealsense2
+flask
+
+# 实机 FK / arm_sdk（需自行从 Unitree SDK 源码安装，不入 PyPI）：
+# cyclonedds
+# unitree_sdk2_python
