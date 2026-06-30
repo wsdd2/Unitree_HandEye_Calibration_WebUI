@@ -11,6 +11,28 @@
 - 离线对已保存 session 重新求解
 - **H2 适配层**：虚拟末端 `R_ee`、腰关节锁定 FK
 
+## 网页界面预览
+
+启动 `capture_handeye.py` 并加上 `--stream-debug --stream-fk --headless` 后，在浏览器打开 `http://<机器人主机IP>:<端口>/` 即可操作。下图来自实机调试界面（示例截图，不含可复用的现场配置）。
+
+### 1. Eye-in-hand 采集待命
+
+![Eye-in-hand 网页待命状态](docs/images/web_ui_eye_in_hand_idle.png)
+
+左侧为 RealSense 实时画面，叠加 `mode`、`chessboard`、`saved`、棋盘尺寸与 `hand_frame` 等状态；右侧提供 **Save / Solve / Quit** 及 SDK 模式切换按钮，下方 JSON 同步刷新相机信息与 FK 状态。此时尚未检测到棋盘格（`chessboard=0`）。
+
+### 2. 棋盘格检测成功 + 扩展控制
+
+![棋盘格检测与 Arm Waypoint 控制](docs/images/web_ui_plan_b_board_detected.png)
+
+棋盘格角点与坐标轴叠加在画面上，可读取 `wrist→board` 距离等调试信息。右侧除基础采集按钮外，还可启用 **Arm Waypoints**（保存/切换/运动 waypoint）与 **Plan B Touch**（触达验证）等扩展流程；JSON 中会输出 `board_extrinsic`、`transform` 等中间结果。
+
+### 3. 角点标注与实时 FK
+
+![角点标注与关节 FK JSON](docs/images/web_ui_chessboard_fk_live.png)
+
+检测成功时角点以彩色圆点标出（`chessboard=1`）。画面左上角提示快捷键：`SPACE` 采集、`S` 求解、`Q` 退出。右侧 JSON 实时显示 `right_arm_joints` 与 `transform_matrix`，用于确认每次按 **Save** 时保存的机器人位姿与图像一致。
+
 ## 目录结构
 
 ```text
