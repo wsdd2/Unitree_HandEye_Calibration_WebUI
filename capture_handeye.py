@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import random
 import sys
@@ -34,18 +35,37 @@ from handeye_calib.chessboard import (
 )
 from handeye_calib.debug_stream import DebugStreamServer
 from handeye_calib.io_utils import load_camera_params, save_capture_record
+from handeye_calib.intrinsics import validate_intrinsics_manifest
 from handeye_calib.solver import load_capture_records, normalize_mode, opencv_method_from_name, solve_handeye
-from handeye_calib.transforms import parse_pose_text, pose_to_transform
+from handeye_calib.strict_pipeline import validate_live_fk_snapshot
+from handeye_calib.transforms import (
+    EULER_MODE_ROS_RPY,
+    parse_pose_text,
+    pose_to_transform,
+)
+from handeye_calib.validation import mount_mode_mismatch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_ARM_PRESETS_JSON = PROJECT_ROOT / "data" / "arm_presets.json"
-DEFAULT_WRIST_CAM_SERIAL = ""
-DEFAULT_HEAD_CAM_SERIAL = ""
-DEFAULT_FK_URDF = PROJECT_ROOT / "robots" / "g1" / "g1_29dof_mode_15_with_dex1_1.urdf"
-DEFAULT_HAND_FRAME = "right_dex1_gripper_tcp"
+DEFAULT_WRIST_CAM_SERIAL = "349622074791"
+DEFAULT_HEAD_CAM_SERIAL = "254322072703"
+DEFAULT_FK_URDF = (
+    WORKSPACE_ROOT
+    / "unitree_ros"
+    / "robots"
+    / "h2_description"
+    / "H2.urdf"
+)
+DEFAULT_ARM_SIDE = "right"
+DEFAULT_BASE_FRAME = "torso_link"
+DEFAULT_HAND_FRAMES = {
+    "left": "left_wrist_yaw_link",
+    "right": "right_wrist_yaw_link",
+}
 RIGHT_DEX1_BASE_LINK = "right_dex1_base_link"
 RIGHT_DEX1_FINGER_LINK_1 = "right_dex1_finger_link_1"
 RIGHT_DEX1_FINGER_LINK_2 = "right_dex1_finger_link_2"
@@ -60,10 +80,19 @@ DEX1_GRIPPER_FRAMES = {
     RIGHT_DEX1_FINGER_LINK_1,
     RIGHT_DEX1_FINGER_LINK_2,
 }
-DEFAULT_RIGHT_ARM_FK_TARGETS = (
-    "right_shoulder_pitch_link,right_elbow_link,right_wrist_yaw_link,"
-    f"{RIGHT_DEX1_GRIPPER_TCP}"
-)
+DEFAULT_ARM_FK_TARGETS = {
+    "left": "left_shoulder_pitch_link,left_elbow_link,left_wrist_yaw_link",
+    "right": "right_shoulder_pitch_link,right_elbow_link,right_wrist_yaw_link",
+}
+LEFT_ARM_JOINT_NAMES = {
+    "left_shoulder_pitch_joint",
+    "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint",
+    "left_elbow_joint",
+    "left_wrist_roll_joint",
+    "left_wrist_pitch_joint",
+    "left_wrist_yaw_joint",
+}
 RIGHT_ARM_JOINT_NAMES = {
     "right_shoulder_pitch_joint",
     "right_shoulder_roll_joint",
@@ -73,7 +102,7 @@ RIGHT_ARM_JOINT_NAMES = {
     "right_wrist_pitch_joint",
     "right_wrist_yaw_joint",
 }
-ARM_SDK_WEIGHT = 29
+H2_ARM_SDK_WEIGHT_INDEX = 31
 WAIST_JOINTS = [12, 13, 14]
 LEFT_ARM_JOINTS = list(range(15, 22))
 RIGHT_ARM_JOINTS = list(range(22, 29))
@@ -187,7 +216,7 @@ def resolve_arm_joint_name(name: str) -> int:
 
 class ArmMotionAborted(Exception):
     """Arm ramp/hold interrupted by quit."""
-
+    
 
 class LoopControl:
     """Poll web commands; prioritize quit and allow aborting blocking arm motions."""
@@ -233,7 +262,15 @@ class LoopControl:
 class G1ArmWaypointController:
     """Publish conservative arm waypoints through Unitree rt/arm_sdk."""
 
-    def __init__(self, network_interface: str, domain_id: int, kp: float, kd: float) -> None:
+    def __init__(
+        self,
+        network_interface: str,
+        domain_id: int,
+        kp: float,
+        kd: float,
+        sdk_weight_index: int,
+        lowstate_topic: str,
+    ) -> None:
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher, ChannelSubscriber  # noqa: WPS433
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_  # noqa: WPS433
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowCmd_, LowState_  # noqa: WPS433
@@ -241,6 +278,7 @@ class G1ArmWaypointController:
 
         self.kp = float(kp)
         self.kd = float(kd)
+        self.sdk_weight_index = int(sdk_weight_index)
         self._low_cmd_default = unitree_hg_msg_dds__LowCmd_
         self._crc = CRC()
         self._latest_lowstate = None
@@ -250,7 +288,7 @@ class G1ArmWaypointController:
         else:
             ChannelFactoryInitialize(domain_id)
 
-        self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+        self._subscriber = ChannelSubscriber(lowstate_topic, LowState_)
         self._subscriber.Init(self._on_lowstate, 10)
         self._publisher = ChannelPublisher("rt/arm_sdk", LowCmd_)
         self._publisher.Init()
@@ -274,6 +312,8 @@ class G1ArmWaypointController:
             print("MotionSwitcher after ReleaseMode:", status, result)
             if isinstance(result, dict) and not result.get("name"):
                 return
+        if self.should_abort_motion():
+            raise ArmMotionAborted("arm motion aborted")
         raise RuntimeError("MotionSwitcher mode is still active; arm_sdk command may be ignored.")
 
     def check_motion_mode(self) -> dict[str, Any]:
@@ -320,7 +360,12 @@ class G1ArmWaypointController:
                 cmd.mode_pr = int(lowstate.mode_pr)
             if hasattr(cmd, "mode_machine") and hasattr(lowstate, "mode_machine"):
                 cmd.mode_machine = int(lowstate.mode_machine)
-        cmd.motor_cmd[ARM_SDK_WEIGHT].q = float(weight)
+        if not 0 <= self.sdk_weight_index < len(cmd.motor_cmd):
+            raise RuntimeError(
+                f"arm SDK weight index {self.sdk_weight_index} exceeds "
+                f"motor_cmd size {len(cmd.motor_cmd)}"
+            )
+        cmd.motor_cmd[self.sdk_weight_index].q = float(weight)
         active = set(UPPER_BODY_COMMAND_JOINTS if active_joints is None else active_joints)
         for joint in active:
             motor_cmd = cmd.motor_cmd[joint]
@@ -1238,26 +1283,45 @@ class FKStateProvider:
         hand_frame: str,
         domain_id: int,
         state_timeout: float,
+        lowstate_topic: str,
+        state_source: str,
+        joint_state_topic: str,
         *,
+        arm_side: str,
         use_dex1_gripper: bool,
     ) -> None:
-        robot_kinematics_dir = PROJECT_ROOT / "robot_kinematics"
-        if str(robot_kinematics_dir) not in sys.path:
-            sys.path.insert(0, str(robot_kinematics_dir))
+        robot_kinematics_dir = WORKSPACE_ROOT / "robot_kinematics"
+        joint_to_pose_dir = robot_kinematics_dir / "joint_to_pose"
+        for module_dir in (robot_kinematics_dir, joint_to_pose_dir):
+            if str(module_dir) not in sys.path:
+                sys.path.insert(0, str(module_dir))
 
-        from unitree_sdk2_bridge import UnitreeG1LowStateBridge  # noqa: WPS433
         from fk_urdf import Pose, URDFFK, base_pose_matrix, pose_to_json  # noqa: WPS433
 
         self.hand_frame = hand_frame
+        self.arm_side = arm_side
         self.use_dex1_gripper = use_dex1_gripper
         self._public_targets, self._compute_targets = expand_fk_targets(targets, hand_frame)
         self.base_link = base_link
         self._state_timeout = state_timeout
-        self._bridge = UnitreeG1LowStateBridge(
-            network_interface=network_interface,
-            domain_id=domain_id,
-        )
-        self._model = URDFFK(urdf)
+        self._state_source = state_source
+        if state_source == "ros-joint-states":
+            from ros_joint_state_bridge import ROSJointStateBridge  # noqa: WPS433
+
+            self._bridge = ROSJointStateBridge(topic=joint_state_topic)
+            self._state_topic = self._bridge.state_topic
+        else:
+            from unitree_sdk2_bridge import UnitreeG1LowStateBridge  # noqa: WPS433
+
+            self._bridge = UnitreeG1LowStateBridge(
+                network_interface=network_interface,
+                domain_id=domain_id,
+                lowstate_topic=lowstate_topic,
+            )
+            self._state_topic = self._bridge.lowstate_topic
+        self._urdf_path = Path(urdf).expanduser().resolve()
+        self._urdf_sha256 = hashlib.sha256(self._urdf_path.read_bytes()).hexdigest()
+        self._model = URDFFK(self._urdf_path)
         self._base_pose = base_pose_matrix(None, None, None)
         self._pose_to_json = pose_to_json
         self._Pose = Pose
@@ -1268,9 +1332,50 @@ class FKStateProvider:
             except Exception as exc:
                 print(f"[STREAM][FK][WARN] Dex1 state unavailable, finger joints default to 0: {exc}", file=sys.stderr)
 
-    def snapshot(self) -> dict:
-        self._bridge.wait_for_state(self._state_timeout)
-        joint_values = self._bridge.latest_joint_positions()
+    def snapshot(
+        self,
+        *,
+        target_host_monotonic_sec: Optional[float] = None,
+        max_sync_delta_sec: Optional[float] = None,
+        max_state_age_sec: Optional[float] = None,
+        max_joint_velocity_rad_s: Optional[float] = None,
+    ) -> dict:
+        self._bridge.wait_for_state(
+            self._state_timeout,
+            max_age_sec=max_state_age_sec,
+        )
+        if target_host_monotonic_sec is None:
+            timed_state = self._bridge.nearest_state(
+                time.monotonic(),
+                max_age_sec=max_state_age_sec,
+            )
+        else:
+            timed_state = self._bridge.nearest_state(
+                target_host_monotonic_sec,
+                max_delta_sec=max_sync_delta_sec,
+                max_age_sec=max_state_age_sec,
+            )
+        state_samples = timed_state.joints
+        joint_values = {name: sample.q for name, sample in state_samples.items()}
+        joint_velocities = {name: sample.dq for name, sample in state_samples.items()}
+        sync_delta_sec = (
+            None
+            if target_host_monotonic_sec is None
+            else timed_state.host_monotonic_sec - float(target_host_monotonic_sec)
+        )
+        relevant_names = LEFT_ARM_JOINT_NAMES if self.arm_side == "left" else RIGHT_ARM_JOINT_NAMES
+        max_abs_velocity = max(
+            (abs(joint_velocities.get(name, 0.0)) for name in relevant_names),
+            default=0.0,
+        )
+        if (
+            max_joint_velocity_rad_s is not None
+            and max_abs_velocity > float(max_joint_velocity_rad_s)
+        ):
+            raise RuntimeError(
+                f"Arm is still moving: max |dq|={max_abs_velocity:.4f} rad/s, "
+                f"limit={float(max_joint_velocity_rad_s):.4f} rad/s"
+            )
         dex1_state_available = False
         dex1_finger_q = 0.0
         if self.use_dex1_gripper:
@@ -1302,19 +1407,39 @@ class FKStateProvider:
                 matrix=tcp_matrix.tolist(),
             )
         return {
-            "source": "rt/lowstate",
+            "source": self._state_source,
+            "state_topic": self._state_topic,
+            "timing": {
+                "image_host_monotonic_sec": target_host_monotonic_sec,
+                "lowstate_host_monotonic_sec": timed_state.host_monotonic_sec,
+                "sync_delta_sec": sync_delta_sec,
+                "state_age_sec_at_snapshot": max(
+                    0.0, time.monotonic() - timed_state.host_monotonic_sec
+                ),
+            },
+            "model": {
+                "urdf_path": str(self._urdf_path),
+                "urdf_sha256": self._urdf_sha256,
+            },
             "base_link": self.base_link,
             "hand_frame": self.hand_frame,
+            "arm_side": self.arm_side,
             "targets": {
                 link_name: self._pose_to_json(poses[link_name], "xyzw")
                 for link_name in self._public_targets
                 if link_name in poses
             },
-            "right_arm_joints": {
+            "arm_joints": {
                 name: joint_values[name]
                 for name in sorted(joint_values)
-                if name in RIGHT_ARM_JOINT_NAMES
+                if name in (LEFT_ARM_JOINT_NAMES if self.arm_side == "left" else RIGHT_ARM_JOINT_NAMES)
             },
+            "arm_joint_velocities_rad_s": {
+                name: joint_velocities[name]
+                for name in sorted(joint_velocities)
+                if name in relevant_names
+            },
+            "max_abs_arm_joint_velocity_rad_s": max_abs_velocity,
             "dex1": {
                 "enabled": self.use_dex1_gripper,
                 "finger_q": dex1_finger_q,
@@ -1343,6 +1468,16 @@ def camera_dir_name(args: argparse.Namespace) -> str:
 def robot_context(args: argparse.Namespace) -> dict:
     return {
         "robot_model": args.robot_model,
+        "arm_side": args.arm_side,
+        "base_frame": args.fk_base_link,
+        "hand_frame": args.hand_frame,
+        "fk_state_source": args.fk_state_source,
+        "fk_state_topic": (
+            args.fk_joint_state_topic
+            if args.fk_state_source == "ros-joint-states"
+            else args.fk_lowstate_topic
+        ),
+        "fk_lowstate_topic": args.fk_lowstate_topic,
         "robot_host": args.robot_host,
         "robot_user": args.robot_user,
         "ros_distro": args.ros_distro,
@@ -1351,16 +1486,17 @@ def robot_context(args: argparse.Namespace) -> dict:
     }
 
 
-def warn_if_mount_mismatch(mode: str, mount: str) -> None:
-    if not mount:
+def validate_mount_mode(mode: str, mount: str, *, allow_mismatch: bool) -> None:
+    mismatch = mount_mode_mismatch(mode, mount)
+    if mismatch is None:
         return
-    mount_key = mount.strip().lower().replace("-", "_")
-    eye_in_hand_mounts = {"hand", "wrist", "flange", "palm", "tool", "end_effector", "gripper"}
-    eye_to_hand_mounts = {"head", "fixed", "external", "tripod", "base", "world"}
-    if mode == "eye_in_hand" and mount_key in eye_to_hand_mounts:
-        print(f"[WARN] mode={mode} 但 camera_mount={mount} 看起来像固定/头部相机，请确认模式是否选反。")
-    if mode == "eye_to_hand" and mount_key in eye_in_hand_mounts:
-        print(f"[WARN] mode={mode} 但 camera_mount={mount} 看起来像末端相机，请确认模式是否选反。")
+    if allow_mismatch:
+        print(f"[CAMERA][WARN] {mismatch}；已由 --allow-mount-mode-mismatch 放行。")
+        return
+    raise RuntimeError(
+        f"{mismatch}；拒绝采集，避免使用错误手眼方程。"
+        "如已确认是特殊安装，请显式添加 --allow-mount-mode-mismatch。"
+    )
 
 
 def parse_name_list(values: Optional[list[str]]) -> list[str]:
@@ -1409,31 +1545,31 @@ def compute_dex1_gripper_tcp_matrix(
 def build_fk_provider(args: argparse.Namespace) -> Optional[FKStateProvider]:
     if not args.stream_fk:
         return None
-    hand_frame = normalize_hand_frame(args.hand_frame)
+    hand_frame = normalize_hand_frame(args.hand_frame, args.arm_side)
     targets = parse_name_list(args.fk_target)
     if not targets:
-        targets = parse_name_list([DEFAULT_RIGHT_ARM_FK_TARGETS])
+        targets = parse_name_list([DEFAULT_ARM_FK_TARGETS[args.arm_side]])
     dex1_mode = uses_dex1_gripper(hand_frame, args.fk_urdf)
-    try:
-        return FKStateProvider(
-            network_interface=args.fk_network_interface,
-            urdf=args.fk_urdf,
-            base_link=args.fk_base_link,
-            targets=targets,
-            hand_frame=hand_frame,
-            domain_id=args.fk_domain_id,
-            state_timeout=args.fk_state_timeout,
-            use_dex1_gripper=dex1_mode,
-        )
-    except Exception as exc:
-        print(f"[STREAM][FK][WARN] disabled: {exc}", file=sys.stderr)
-        return None
+    return FKStateProvider(
+        network_interface=args.fk_network_interface,
+        urdf=args.fk_urdf,
+        base_link=args.fk_base_link,
+        targets=targets,
+        hand_frame=hand_frame,
+        domain_id=args.fk_domain_id,
+        state_timeout=args.fk_state_timeout,
+        lowstate_topic=args.fk_lowstate_topic,
+        state_source=args.fk_state_source,
+        joint_state_topic=args.fk_joint_state_topic,
+        arm_side=args.arm_side,
+        use_dex1_gripper=dex1_mode,
+    )
 
 
-def normalize_hand_frame(hand_frame: str) -> str:
+def normalize_hand_frame(hand_frame: str, arm_side: str = DEFAULT_ARM_SIDE) -> str:
     frame = hand_frame.strip()
     if frame in {"", "hand", "gripper", "end_effector", "tool", "flange", "palm"}:
-        return DEFAULT_HAND_FRAME
+        return DEFAULT_HAND_FRAMES[arm_side]
     return frame
 
 
@@ -1518,13 +1654,14 @@ def connect_arm_sdk(args: argparse.Namespace) -> G1ArmWaypointController:
         domain_id=args.arm_domain_id,
         kp=args.arm_kp,
         kd=args.arm_kd,
+        sdk_weight_index=args.arm_sdk_weight_index,
+        lowstate_topic=args.arm_lowstate_topic,
     )
     controller.wait_for_lowstate(args.fk_state_timeout)
     if args.arm_release_on_startup:
         controller.release(args.arm_release_seconds, args.arm_control_hz)
     print("[ARM] arm_sdk connected after web confirmation")
     return controller
-
 
 def disconnect_arm_sdk(
     controller: Optional[G1ArmWaypointController],
@@ -1568,28 +1705,74 @@ def arm_waypoint_state(
     return state
 
 
-def resolve_camera_intrinsics(args: argparse.Namespace, cam: RealSenseD435i) -> tuple[np.ndarray, np.ndarray, dict]:
+def resolve_camera_intrinsics(
+    args: argparse.Namespace,
+    cam: RealSenseD435i,
+    camera_info: Optional[dict[str, Any]] = None,
+) -> tuple[np.ndarray, np.ndarray, dict]:
     loaded = load_camera_params(
         camera_matrix_npy=args.camera_matrix_npy,
         dist_coeffs_npy=args.dist_coeffs_npy,
         camera_json=args.camera_json,
     )
     if loaded is not None:
-        return loaded
+        camera_matrix, dist_coeffs, info = loaded
+        manifest = info.get("manifest")
+        if isinstance(manifest, dict):
+            camera_meta = manifest.get("camera", {})
+            stream_meta = manifest.get("stream", {})
+            expected_serial = str((camera_info or {}).get("serial", "")).strip()
+            validate_intrinsics_manifest(
+                manifest,
+                base_dir=Path(info["manifest_path"]).parent,
+                expected_camera_serial=(
+                    expected_serial
+                    if expected_serial and str(camera_meta.get("serial", "")).strip()
+                    else None
+                ),
+                expected_stream_name=(
+                    "color" if str(stream_meta.get("name", "")).strip() else None
+                ),
+                expected_image_size=(args.width, args.height),
+            )
+        else:
+            if (
+                getattr(args, "strict_capture", False)
+                and not getattr(args, "allow_legacy_intrinsics", False)
+            ):
+                raise ValueError(
+                    "--strict-capture requires intrinsics_manifest.json; "
+                    "use --allow-legacy-intrinsics only with explicit approval"
+                )
+            print(
+                "[INTRINSICS][WARN] legacy NPY/JSON has no intrinsics_manifest.json; "
+                "cannot verify camera serial/stream. Size is checked from K only.",
+                file=sys.stderr,
+            )
+            cx = float(camera_matrix[0, 2])
+            cy = float(camera_matrix[1, 2])
+            if not (0.0 <= cx < args.width and 0.0 <= cy < args.height):
+                raise ValueError(
+                    f"内参主点 ({cx:.2f}, {cy:.2f}) 不在请求图像 "
+                    f"{args.width}x{args.height} 内"
+                )
+        return camera_matrix, dist_coeffs, info
     camera_matrix, dist_coeffs, info = cam.color_intrinsics()
     info["source"] = "realsense_profile"
+    info["camera_matrix"] = camera_matrix.astype(float).tolist()
+    info["dist_coeffs"] = dist_coeffs.reshape(-1).astype(float).tolist()
     return camera_matrix, dist_coeffs, info
 
 
 def run_capture(args: argparse.Namespace) -> int:
     mode = normalize_mode(args.mode)
-    args.hand_frame = normalize_hand_frame(args.hand_frame)
+    args.hand_frame = normalize_hand_frame(args.hand_frame, args.arm_side)
     if args.stream_fk and uses_dex1_gripper(args.hand_frame, args.fk_urdf):
         urdf_text = Path(args.fk_urdf).read_text(encoding="utf-8")
         if RIGHT_DEX1_BASE_LINK not in urdf_text:
             raise ValueError(
                 f"hand_frame={args.hand_frame} 需要 Dex1 URDF，"
-                f"请使用 {DEFAULT_FK_URDF.name} 或显式传入 --fk-urdf"
+                "请通过 --fk-urdf 显式传入包含 right_dex1_* links 的 URDF"
             )
     if args.stream_fk and args.stream_debug:
         print(f"[HAND] frame={args.hand_frame} urdf={Path(args.fk_urdf).name}")
@@ -1599,14 +1782,18 @@ def run_capture(args: argparse.Namespace) -> int:
     objp = build_object_points(args.cols, args.rows, args.square_mm)
     data_root = Path(args.data_root) if args.data_root else DEFAULT_DATA_ROOT
     output_dir = Path(args.output_dir) if args.output_dir else DEFAULT_OUTPUT_DIR
-    session_name = args.session_name or f"{mode}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    session_name = args.session_name or f"{mode}_{args.arm_side}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     session_dir = data_root / session_name / camera_dir_name(args)
     saved_count = len(list(session_dir.glob("*.json"))) if session_dir.exists() else 0
     last_msg = ""
     last_msg_ts = 0.0
     last_warning: dict[str, Any] = {}
     warning_seq = 0
-    warn_if_mount_mismatch(mode, args.camera_mount)
+    validate_mount_mode(
+        mode,
+        args.camera_mount,
+        allow_mismatch=args.allow_mount_mode_mismatch,
+    )
     stream_server = None
     fk_provider = None
     arm_controller = None
@@ -1623,6 +1810,17 @@ def run_capture(args: argparse.Namespace) -> int:
     last_fk_ts = 0.0
     loop_control = LoopControl(None)
     if args.stream_debug:
+        fk_provider = build_fk_provider(args)
+        if fk_provider is not None:
+            last_fk_state = fk_provider.snapshot(
+                max_state_age_sec=args.fk_max_state_age_sec,
+            )
+            print(
+                "[FK] ready "
+                f"source={args.fk_state_source} "
+                f"topic={fk_provider._state_topic} "
+                f"base={args.fk_base_link} hand={args.hand_frame}"
+            )
         stream_server = DebugStreamServer(
             host=args.stream_host,
             port=args.stream_port,
@@ -1630,7 +1828,6 @@ def run_capture(args: argparse.Namespace) -> int:
         )
         stream_server.start()
         print(f"[STREAM] http://{args.stream_host}:{args.stream_port}")
-        fk_provider = build_fk_provider(args)
         loop_control = LoopControl(stream_server)
         if args.enable_arm_waypoints:
             arm_joint_limits = load_urdf_joint_limits(args.fk_urdf)
@@ -1662,6 +1859,16 @@ def run_capture(args: argparse.Namespace) -> int:
 
     cam, camera_info, camera_error = try_open_camera(args)
     camera_available = cam is not None
+    if camera_available:
+        try:
+            validate_mount_mode(
+                mode,
+                str(camera_info.get("mount", "")),
+                allow_mismatch=args.allow_mount_mode_mismatch,
+            )
+        except Exception:
+            cam.close()
+            raise
     arm_debug_mode = args.arm_only or not camera_available
     if arm_debug_mode:
         if camera_error:
@@ -1675,7 +1882,11 @@ def run_capture(args: argparse.Namespace) -> int:
 
     try:
         if camera_available:
-            camera_matrix, dist_coeffs, camera_intrinsics = resolve_camera_intrinsics(args, cam)
+            camera_matrix, dist_coeffs, camera_intrinsics = resolve_camera_intrinsics(
+                args,
+                cam,
+                camera_info,
+            )
         else:
             camera_matrix, dist_coeffs, camera_intrinsics = resolve_intrinsics_without_camera(args)
             camera_info = dict(camera_info)
@@ -1685,7 +1896,16 @@ def run_capture(args: argparse.Namespace) -> int:
             cv2.namedWindow(win, cv2.WINDOW_NORMAL)
             cv2.resizeWindow(win, args.width, args.height)
         print(f"[SESSION] {session_dir.resolve()}")
-        print(f"[MODE] {mode}")
+        print(f"[MODE] {mode} arm_side={args.arm_side}")
+        if mode == "eye_in_hand" and args.fk_base_link == "torso_link":
+            print(
+                "[ASSUMPTION] eye-in-hand 外部棋盘要求 torso_link 在整组采集期间"
+                "相对棋盘保持静止。"
+            )
+        elif mode == "eye_to_hand" and args.fk_base_link == "torso_link":
+            print(
+                "[ASSUMPTION] eye-to-hand 要求固定相机与 torso_link 全程刚性不变。"
+            )
         print(f"[CAMERA] {camera_info}")
         print(f"[ROBOT] {robot_context(args)}")
         print(f"[INTRINSICS] {camera_intrinsics.get('source')}")
@@ -1723,6 +1943,10 @@ def run_capture(args: argparse.Namespace) -> int:
             detect_method = "none"
             corners = None
             frame_bgr = None
+            frame_metadata: dict[str, Any] = {}
+            live_target_rvec = None
+            live_target_tvec = None
+            live_target_rms = None
             if camera_available:
                 frame = cam.fetch(timeout_ms=fetch_timeout_ms)
                 if frame is None or frame.get("rgb") is None:
@@ -1737,6 +1961,12 @@ def run_capture(args: argparse.Namespace) -> int:
                         time.sleep(0.02)
                         continue
                 else:
+                    frame_metadata = {
+                        key: value
+                        for key, value in frame.items()
+                        if key not in {"rgb", "depth"}
+                    }
+                    frame_metadata.setdefault("host_monotonic_sec", time.monotonic())
                     frame_bgr = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
                     preview = gamma_correct_bgr(frame_bgr, args.gamma)
                     gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
@@ -1761,6 +1991,17 @@ def run_capture(args: argparse.Namespace) -> int:
                     ],
                 )
 
+            if detected and corners is not None:
+                try:
+                    live_target_rvec, live_target_tvec, live_target_rms = solve_target_pose(
+                        objp,
+                        corners,
+                        camera_matrix,
+                        dist_coeffs,
+                    )
+                except Exception as exc:
+                    print(f"[PREVIEW][PNP][WARN] {exc}", file=sys.stderr)
+
             put_text_bgr_adaptive(
                 vis,
                 f"mode={mode} cam={'on' if camera_available else 'off'} chessboard={int(detected)} saved={saved_count}",
@@ -1773,12 +2014,20 @@ def run_capture(args: argparse.Namespace) -> int:
                 (10, 60),
                 0.6,
             )
+            rms_text = "live_rms=--"
+            if live_target_rms is not None:
+                rms_status = "OK" if live_target_rms <= args.capture_max_reproj_rms_px else "REJECT"
+                rms_text = (
+                    f"live_rms={live_target_rms:.3f}px "
+                    f"limit={args.capture_max_reproj_rms_px:.3f}px {rms_status}"
+                )
+            put_text_bgr_adaptive(vis, rms_text, (10, 90), 0.65)
             if camera_available:
-                put_text_bgr_adaptive(vis, "SPACE=capture  ENTER/S=solve  ESC/q=quit", (10, 90), 0.6)
+                put_text_bgr_adaptive(vis, "SPACE=capture  ENTER/S=solve  ESC/q=quit", (10, 120), 0.6)
             else:
-                put_text_bgr_adaptive(vis, "ARM DEBUG: joint buttons only  ESC/q=quit", (10, 90), 0.6)
+                put_text_bgr_adaptive(vis, "ARM DEBUG: joint buttons only  ESC/q=quit", (10, 120), 0.6)
             if last_msg and time.monotonic() - last_msg_ts < 3.0:
-                put_text_bgr_adaptive(vis, last_msg, (10, 120), 0.6)
+                put_text_bgr_adaptive(vis, last_msg, (10, 150), 0.6)
             if camera_available and not args.headless:
                 cv2.imshow(win, vis)
             if stream_server is not None:
@@ -1793,10 +2042,19 @@ def run_capture(args: argparse.Namespace) -> int:
                 stream_server.update_state(
                     {
                         "mode": mode,
+                        "arm_side": args.arm_side,
+                        "base_frame": args.fk_base_link,
+                        "hand_frame": args.hand_frame,
                         "arm_debug_mode": arm_debug_mode,
                         "camera_available": camera_available,
                         "camera": camera_info,
                         "chessboard_detected": detected,
+                        "target_reprojection_rms_px": live_target_rms,
+                        "capture_max_reprojection_rms_px": args.capture_max_reproj_rms_px,
+                        "capture_quality_ok": (
+                            live_target_rms is not None
+                            and live_target_rms <= args.capture_max_reproj_rms_px
+                        ),
                         "saved_count": saved_count,
                         "session_dir": str(session_dir.resolve()),
                         "last_message": last_msg,
@@ -1932,6 +2190,14 @@ def run_capture(args: argparse.Namespace) -> int:
                     last_msg = "solve rejected: arm debug mode (no camera capture)"
                     last_msg_ts = time.monotonic()
                     continue
+                if args.strict_capture:
+                    last_msg = (
+                        "strict capture: built-in solve disabled; run "
+                        "strict_calibration_pipeline.py handeye"
+                    )
+                    last_msg_ts = time.monotonic()
+                    print(f"[SOLVE][REJECT] {last_msg}", file=sys.stderr)
+                    continue
                 try:
                     records = load_capture_records(session_dir)
                     path = solve_handeye(
@@ -1941,8 +2207,23 @@ def run_capture(args: argparse.Namespace) -> int:
                         min_samples=args.min_samples,
                         method=opencv_method_from_name(args.handeye_method),
                     )
-                    last_msg = f"solve saved: {path.name}"
-                    print(f"[SOLVE] saved: {path.resolve()}")
+                    solved = json.loads(path.read_text(encoding="utf-8"))
+                    quality = solved.get("quality", {})
+                    quality_status = str(quality.get("status", "unknown"))
+                    quality_warnings = quality.get("warnings", [])
+                    if quality_status == "pass":
+                        last_msg = f"solve PASS: {path.name}"
+                        print(f"[SOLVE][PASS] saved: {path.resolve()}")
+                    else:
+                        last_msg = (
+                            f"solve {quality_status.upper()}: "
+                            f"{'; '.join(map(str, quality_warnings)) or 'quality check failed'}"
+                        )
+                        print(
+                            f"[SOLVE][WARN] saved but must not deploy: {path.resolve()} "
+                            f"warnings={quality_warnings}",
+                            file=sys.stderr,
+                        )
                 except Exception as exc:
                     last_msg = f"solve failed: {exc}"
                     print(f"[SOLVE][ERROR] {exc}", file=sys.stderr)
@@ -1967,14 +2248,40 @@ def run_capture(args: argparse.Namespace) -> int:
                 continue
 
             try:
-                if web_command == "save" and fk_provider is not None:
+                capture_fk_state: dict[str, Any] = {}
+                if fk_provider is not None:
+                    image_host_ts = float(
+                        frame_metadata.get("host_monotonic_sec", time.monotonic())
+                    )
+                    capture_fk_state = fk_provider.snapshot(
+                        target_host_monotonic_sec=image_host_ts,
+                        max_sync_delta_sec=args.fk_sync_max_delta_sec,
+                        max_state_age_sec=args.fk_max_state_age_sec,
+                        max_joint_velocity_rad_s=(
+                            None
+                            if args.capture_max_joint_velocity_rad_s == 0.0
+                            else args.capture_max_joint_velocity_rad_s
+                        ),
+                    )
+                    if args.strict_capture:
+                        validate_live_fk_snapshot(
+                            capture_fk_state,
+                            arm_side=args.arm_side,
+                            max_joint_velocity_rad_s=(
+                                args.capture_max_joint_velocity_rad_s
+                            ),
+                        )
                     T_hand2base, pose_text, pose_values = fk_hand_transform(
-                        last_fk_state,
+                        capture_fk_state,
                         args.hand_frame,
                         args.pose_translation_unit,
                         args.pose_rotation_unit,
                     )
                 else:
+                    print(
+                        "[POSE] manual Euler convention="
+                        f"{args.pose_euler_convention}; order={args.euler_order}"
+                    )
                     pose_text = prompt_pose_6d(args.hand_frame)
                     if pose_text is None:
                         last_msg = "capture cancelled"
@@ -1986,9 +2293,23 @@ def run_capture(args: argparse.Namespace) -> int:
                         pose_values,
                         translation_unit=args.pose_translation_unit,
                         rotation_unit=args.pose_rotation_unit,
-                        euler_order=args.euler_order,
+                        euler_order=(
+                            EULER_MODE_ROS_RPY
+                            if args.pose_euler_convention == "ros-rpy"
+                            else args.euler_order
+                        ),
                     )
-                target_rvec, target_tvec, target_rms = solve_target_pose(objp, corners, camera_matrix, dist_coeffs)
+                if live_target_rvec is None or live_target_tvec is None or live_target_rms is None:
+                    target_rvec, target_tvec, target_rms = solve_target_pose(
+                        objp,
+                        corners,
+                        camera_matrix,
+                        dist_coeffs,
+                    )
+                else:
+                    target_rvec = live_target_rvec
+                    target_tvec = live_target_tvec
+                    target_rms = live_target_rms
                 if target_rms > args.capture_max_reproj_rms_px:
                     warning_seq += 1
                     last_msg = (
@@ -2026,9 +2347,35 @@ def run_capture(args: argparse.Namespace) -> int:
                         "translation": args.pose_translation_unit,
                         "rotation": args.pose_rotation_unit,
                         "euler_order": args.euler_order,
+                        "euler_convention": (
+                            "fk_matrix"
+                            if capture_fk_state
+                            else args.pose_euler_convention
+                        ),
                     },
                     T_hand2base=T_hand2base,
                     hand_frame_name=args.hand_frame,
+                    base_frame_name=args.fk_base_link,
+                    capture_timing={
+                        "camera_frame": frame_metadata,
+                        "fk": capture_fk_state.get("timing", {}),
+                        "sync_limit_sec": args.fk_sync_max_delta_sec,
+                        "state_age_limit_sec": args.fk_max_state_age_sec,
+                        "joint_velocity_limit_rad_s": args.capture_max_joint_velocity_rad_s,
+                    },
+                    fk_metadata={
+                        "source": capture_fk_state.get("source"),
+                        "model": capture_fk_state.get("model", {}),
+                        "base_link": capture_fk_state.get("base_link"),
+                        "hand_frame": capture_fk_state.get("hand_frame"),
+                        "arm_joints_rad": capture_fk_state.get("arm_joints", {}),
+                        "arm_joint_velocities_rad_s": capture_fk_state.get(
+                            "arm_joint_velocities_rad_s", {}
+                        ),
+                        "max_abs_arm_joint_velocity_rad_s": capture_fk_state.get(
+                            "max_abs_arm_joint_velocity_rad_s"
+                        ),
+                    },
                 )
             except Exception as exc:
                 last_msg = f"capture failed: {exc}"
@@ -2044,13 +2391,23 @@ def run_capture(args: argparse.Namespace) -> int:
         if cam is not None:
             cam.close()
         RealSenseD435i.set_emitter(None)
-        cv2.destroyAllWindows()
+        if not args.headless:
+            try:
+                cv2.destroyAllWindows()
+            except cv2.error:
+                pass
     return 0
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="RealSense D435i 灵巧手手眼标定采集")
     parser.add_argument("--mode", required=True, help="eye-in-hand/hand-in-eye 或 eye-to-hand/hand-to-eye")
+    parser.add_argument(
+        "--arm-side",
+        choices=("left", "right"),
+        default=DEFAULT_ARM_SIDE,
+        help="标定板所在手臂；决定默认 hand frame 和 FK targets（默认 right）",
+    )
     parser.add_argument("--cam-index", type=int, default=0)
     parser.add_argument("--cam-serial", type=str, default="", help=f"主相机序列号，默认腕部 D435 ({DEFAULT_WRIST_CAM_SERIAL})")
     parser.add_argument(
@@ -2065,6 +2422,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-fallback-mount", type=str, default="", help="fallback 头部相机 mount，默认 head")
     parser.add_argument("--camera-name", type=str, default="", help="主相机名称，默认 right_hand_d435")
     parser.add_argument("--camera-mount", type=str, default="", help="主相机安装位，默认 wrist")
+    parser.add_argument(
+        "--allow-mount-mode-mismatch",
+        action="store_true",
+        help="显式允许相机安装位与手眼模式不匹配；默认拒绝以防错误求解",
+    )
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
     parser.add_argument("--fps", type=int, default=30)
@@ -2080,11 +2442,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="")
     parser.add_argument("--session-name", type=str, default="")
     parser.add_argument("--min-samples", type=int, default=8)
+    parser.add_argument(
+        "--strict-capture",
+        action="store_true",
+        help=(
+            "Require a validated intrinsics manifest and complete stationary FK; "
+            "disable the legacy built-in solver"
+        ),
+    )
+    parser.add_argument(
+        "--allow-legacy-intrinsics",
+        action="store_true",
+        help=(
+            "Explicitly allow K/D files without intrinsics_manifest.json; "
+            "provenance checks are waived"
+        ),
+    )
     parser.add_argument("--capture-max-reproj-rms-px", type=float, default=0.5, help="Save 时允许的单帧棋盘重投影 RMS 上限，超过则拒绝保存")
     parser.add_argument("--pose-translation-unit", choices=("mm", "m"), default="mm")
     parser.add_argument("--pose-rotation-unit", choices=("deg", "rad"), default="deg")
     parser.add_argument("--euler-order", choices=("xyz", "xzy", "yxz", "yzx", "zxy", "zyx"), default="xyz")
-    parser.add_argument("--hand-frame", type=str, default=DEFAULT_HAND_FRAME, help="Save/FK 位姿所属 link；默认 right_dex1_gripper_tcp（Dex1-1 两指中点）")
+    parser.add_argument(
+        "--pose-euler-convention",
+        choices=("legacy", "ros-rpy"),
+        default="legacy",
+        help=(
+            "仅手工位姿输入：legacy 保持历史 R=Rx*Ry*Rz/--euler-order 行为；"
+            "ros-rpy 使用 ROS 固定轴 R=Rz(yaw)*Ry(pitch)*Rx(roll)"
+        ),
+    )
+    parser.add_argument(
+        "--hand-frame",
+        type=str,
+        default="",
+        help="Save/FK 位姿所属 link；默认按 --arm-side 选择 left/right_wrist_yaw_link",
+    )
     parser.add_argument("--handeye-method", choices=("tsai", "park", "horaud", "andreff", "daniilidis"), default="tsai")
     parser.add_argument("--enable-emitter", action="store_true", help="开启当前 D435i 深度发射器；默认关闭以减少棋盘反光")
     parser.add_argument("--color-only", action="store_true", help="只打开彩色流，不打开深度流；适合棋盘格/内参采集")
@@ -2102,25 +2494,73 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stream-fk", action="store_true", help="在网页状态面板中显示实时 FK 位姿")
     parser.add_argument("--fk-network-interface", type=str, default="eth0", help="Unitree DDS 网卡，如 eth0")
     parser.add_argument("--fk-domain-id", type=int, default=0)
+    parser.add_argument(
+        "--fk-state-source",
+        choices=("unitree-dds", "ros-joint-states"),
+        default="unitree-dds",
+        help="FK 关节状态来源；DDS 冲突的 ROS 容器使用 ros-joint-states",
+    )
+    parser.add_argument(
+        "--fk-joint-state-topic",
+        type=str,
+        default="/joint_states",
+        help="--fk-state-source ros-joint-states 时订阅的 ROS 话题",
+    )
+    parser.add_argument(
+        "--fk-lowstate-topic",
+        type=str,
+        default="rt/lowstate",
+        help="Unitree LowState DDS topic；跨机低频链路常用 rt/lf/lowstate",
+    )
     parser.add_argument("--fk-state-timeout", type=float, default=1.0)
     parser.add_argument("--fk-update-period", type=float, default=0.5, help="FK 面板刷新间隔，单位秒")
+    parser.add_argument(
+        "--fk-sync-max-delta-sec",
+        type=float,
+        default=0.10,
+        help="保存时图像与最近 lowstate 的最大主机时间差",
+    )
+    parser.add_argument(
+        "--fk-max-state-age-sec",
+        type=float,
+        default=0.25,
+        help="保存时允许的 lowstate 最大陈旧时间",
+    )
+    parser.add_argument(
+        "--capture-max-joint-velocity-rad-s",
+        type=float,
+        default=0.08,
+        help="保存时手臂最大关节速度阈值；超过则认为未静止",
+    )
     parser.add_argument(
         "--fk-urdf",
         type=str,
         default=str(DEFAULT_FK_URDF),
-        help="FK URDF；默认 g1_29dof_mode_15_with_dex1_1.urdf（含 Dex1-1）",
+        help=f"FK URDF；H2 默认 {DEFAULT_FK_URDF}",
     )
-    parser.add_argument("--fk-base-link", type=str, default="pelvis")
+    parser.add_argument("--fk-base-link", type=str, default=DEFAULT_BASE_FRAME, help="标定基准坐标系，H2 运控默认 torso_link")
     parser.add_argument(
         "--fk-target",
         action="append",
-        help="要显示 FK 的 link，可重复传入或逗号分隔；默认右臂相关 link",
+        help="要显示 FK 的 link，可重复传入或逗号分隔；默认按 --arm-side 选择对应手臂",
     )
     parser.add_argument("--enable-arm-waypoints", action="store_true", help="网页显示控臂面板；默认不接管 arm_sdk，需二次确认后才连接")
     parser.add_argument("--arm-sdk-on-startup", dest="arm_sdk_on_startup", action="store_true", default=False, help="启动时立即连接 arm_sdk（旧行为）")
     parser.add_argument("--arm-waypoints-json", type=str, default="", help="arm waypoint JSON；默认保存到当前 session 下")
     parser.add_argument("--arm-network-interface", type=str, default="", help="Unitree DDS 网卡；默认使用 DDS 默认网卡")
     parser.add_argument("--arm-domain-id", type=int, default=0)
+    parser.add_argument(
+        "--arm-lowstate-topic",
+        type=str,
+        default="rt/lowstate",
+        help="网页控臂读取的 LowState topic",
+    )
+    parser.add_argument(
+        "--arm-sdk-weight-index",
+        type=int,
+        default=H2_ARM_SDK_WEIGHT_INDEX,
+        help="H2 arm_sdk 权重槽位为 31；G1 需显式改为 29",
+    )
     parser.add_argument("--arm-control-hz", type=float, default=50.0)
     parser.add_argument("--arm-ramp-seconds", type=float, default=1.5)
     parser.add_argument("--arm-hold-seconds", type=float, default=1.0)
@@ -2165,10 +2605,40 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stream-port 必须 > 0")
     if args.fk_update_period <= 0:
         parser.error("--fk-update-period 必须 > 0")
+    if args.fk_sync_max_delta_sec <= 0:
+        parser.error("--fk-sync-max-delta-sec 必须 > 0")
+    if args.fk_max_state_age_sec <= 0:
+        parser.error("--fk-max-state-age-sec 必须 > 0")
+    if not args.fk_lowstate_topic.strip():
+        parser.error("--fk-lowstate-topic 不能为空")
+    if not args.fk_joint_state_topic.strip():
+        parser.error("--fk-joint-state-topic 不能为空")
+    if args.capture_max_joint_velocity_rad_s < 0:
+        parser.error("--capture-max-joint-velocity-rad-s 必须 >= 0；0 表示关闭")
+    if args.strict_capture:
+        if args.min_samples < 24:
+            parser.error("--strict-capture requires --min-samples >= 24")
+        if args.fk_sync_max_delta_sec > 0.03:
+            parser.error(
+                "--strict-capture requires --fk-sync-max-delta-sec <= 0.03"
+            )
+        if args.fk_max_state_age_sec > 0.10:
+            parser.error(
+                "--strict-capture requires --fk-max-state-age-sec <= 0.10"
+            )
+        if args.capture_max_joint_velocity_rad_s > 0.01:
+            parser.error(
+                "--strict-capture requires "
+                "--capture-max-joint-velocity-rad-s <= 0.01"
+            )
     if args.stream_fk and not args.stream_debug:
         parser.error("--stream-fk 需要同时指定 --stream-debug")
+    if args.headless and not args.stream_debug:
+        parser.error("--headless 需要同时指定 --stream-debug，否则无法 Save/Solve")
     if args.enable_arm_waypoints and not args.stream_debug:
         parser.error("--enable-arm-waypoints 需要同时指定 --stream-debug")
+    if args.arm_side == "left" and args.enable_arm_waypoints:
+        parser.error("左臂标定暂不支持网页 arm_sdk 控臂；请用外部运控移动左臂，网页仅负责 Save/Solve")
     if args.arm_control_hz <= 0:
         parser.error("--arm-control-hz 必须 > 0")
     if args.arm_ramp_seconds <= 0:
@@ -2189,6 +2659,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--arm-limit-margin-rad 必须 >= 0")
     if args.arm_kp < 0 or args.arm_kd < 0:
         parser.error("--arm-kp/--arm-kd 必须 >= 0")
+    if args.arm_sdk_weight_index < 0:
+        parser.error("--arm-sdk-weight-index 必须 >= 0")
+    if not args.arm_lowstate_topic.strip():
+        parser.error("--arm-lowstate-topic 不能为空")
     if args.arm_joint_default_delta_rad <= 0:
         parser.error("--arm-joint-default-delta-rad 必须 > 0")
     if args.test_delta_rad <= 0:
@@ -2213,7 +2687,7 @@ def parse_args() -> argparse.Namespace:
         args.allow_no_camera = True
     if args.arm_only and (not args.stream_debug or not args.enable_arm_waypoints):
         parser.error("--arm-only 需要同时指定 --stream-debug 和 --enable-arm-waypoints")
-    args.hand_frame = normalize_hand_frame(args.hand_frame)
+    args.hand_frame = normalize_hand_frame(args.hand_frame, args.arm_side)
     if uses_dex1_gripper(args.hand_frame, args.fk_urdf):
         urdf_path = Path(args.fk_urdf)
         if urdf_path.exists():
@@ -2221,7 +2695,7 @@ def parse_args() -> argparse.Namespace:
             if RIGHT_DEX1_BASE_LINK not in urdf_text:
                 parser.error(
                     f"--hand-frame {args.hand_frame} 需要 Dex1 URDF，"
-                    f"请改用 {DEFAULT_FK_URDF}"
+                    "请通过 --fk-urdf 传入包含 right_dex1_* links 的 URDF"
                 )
     normalize_mode(args.mode)
     return args

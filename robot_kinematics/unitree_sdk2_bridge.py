@@ -15,6 +15,7 @@ import json
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence
@@ -83,6 +84,14 @@ class JointSample:
     tau_est: float
 
 
+@dataclass(frozen=True)
+class TimedJointState:
+    """One lowstate sample timestamped on receipt with a monotonic clock."""
+
+    host_monotonic_sec: float
+    joints: Dict[str, JointSample]
+
+
 def import_unitree_sdk2() -> Dict[str, object]:
     """Import SDK2 symbols lazily so offline FK/IK code remains importable."""
 
@@ -102,8 +111,9 @@ def import_unitree_sdk2() -> Dict[str, object]:
         from unitree_sdk2py.utils.crc import CRC  # type: ignore
     except ImportError as exc:
         raise RuntimeError(
-            "Missing unitree_sdk2_python. Install it inside WSL2 Ubuntu first, "
-            "then run this script from that environment."
+            "Failed to import unitree_sdk2_python or one of its native "
+            "dependencies. Check PYTHONPATH and the CycloneDDS "
+            "LD_LIBRARY_PATH in the current runtime environment."
         ) from exc
 
     return {
@@ -126,10 +136,14 @@ class UnitreeG1LowStateBridge:
         domain_id: int = 0,
         joint_index: Mapping[str, int] = G1_29DOF_JOINT_INDEX,
         enable_publisher: bool = False,
+        history_size: int = 512,
+        lowstate_topic: str = "rt/lowstate",
     ) -> None:
         self.sdk = import_unitree_sdk2()
         self.joint_index = dict(joint_index)
         self._latest: Dict[str, JointSample] = {}
+        self._latest_host_monotonic_sec: Optional[float] = None
+        self._history: deque[TimedJointState] = deque(maxlen=max(2, int(history_size)))
         self._lock = threading.Lock()
         self._ready = threading.Event()
 
@@ -141,7 +155,11 @@ class UnitreeG1LowStateBridge:
 
         low_state_type = self.sdk["LowState_"]
         subscriber_cls = self.sdk["ChannelSubscriber"]
-        self._subscriber = subscriber_cls("rt/lowstate", low_state_type)
+        topic = str(lowstate_topic).strip()
+        if not topic:
+            raise ValueError("lowstate_topic must not be empty")
+        self.lowstate_topic = topic
+        self._subscriber = subscriber_cls(topic, low_state_type)
         self._subscriber.Init(self._on_low_state, 10)
 
         self._publisher = None
@@ -156,6 +174,7 @@ class UnitreeG1LowStateBridge:
             self._crc = self.sdk["CRC"]()
 
     def _on_low_state(self, msg: object) -> None:
+        received_at = time.monotonic()
         motor_state = getattr(msg, "motor_state")
         latest: Dict[str, JointSample] = {}
         for joint_name, index in self.joint_index.items():
@@ -170,19 +189,71 @@ class UnitreeG1LowStateBridge:
 
         with self._lock:
             self._latest = latest
+            self._latest_host_monotonic_sec = received_at
+            self._history.append(TimedJointState(received_at, latest))
         self._ready.set()
 
-    def wait_for_state(self, timeout: float) -> Dict[str, JointSample]:
+    def wait_for_state(
+        self,
+        timeout: float,
+        *,
+        max_age_sec: Optional[float] = None,
+    ) -> Dict[str, JointSample]:
         if not self._ready.wait(timeout):
             raise TimeoutError(
                 "Timed out waiting for rt/lowstate. Check robot power, WiFi, "
                 "WSL2 networking, and --network-interface."
             )
-        return self.latest_state()
+        state = self.latest_state()
+        if max_age_sec is not None:
+            age = self.latest_state_age_sec()
+            if age is None or age > float(max_age_sec):
+                raise TimeoutError(
+                    f"Latest rt/lowstate is stale: age={age!r}s, "
+                    f"limit={float(max_age_sec):.3f}s"
+                )
+        return state
 
     def latest_state(self) -> Dict[str, JointSample]:
         with self._lock:
             return dict(self._latest)
+
+    def latest_state_host_monotonic_sec(self) -> Optional[float]:
+        with self._lock:
+            return self._latest_host_monotonic_sec
+
+    def latest_state_age_sec(self) -> Optional[float]:
+        timestamp = self.latest_state_host_monotonic_sec()
+        return None if timestamp is None else max(0.0, time.monotonic() - timestamp)
+
+    def nearest_state(
+        self,
+        host_monotonic_sec: float,
+        *,
+        max_delta_sec: Optional[float] = None,
+        max_age_sec: Optional[float] = None,
+    ) -> TimedJointState:
+        """Return the received lowstate nearest to a host-clock timestamp."""
+
+        with self._lock:
+            history = list(self._history)
+        if not history:
+            raise TimeoutError("No rt/lowstate history is available.")
+        target = float(host_monotonic_sec)
+        nearest = min(history, key=lambda item: abs(item.host_monotonic_sec - target))
+        delta = abs(nearest.host_monotonic_sec - target)
+        if max_delta_sec is not None and delta > float(max_delta_sec):
+            raise TimeoutError(
+                f"No synchronized rt/lowstate: nearest delta={delta:.3f}s, "
+                f"limit={float(max_delta_sec):.3f}s"
+            )
+        age = max(0.0, time.monotonic() - nearest.host_monotonic_sec)
+        if max_age_sec is not None and age > float(max_age_sec):
+            raise TimeoutError(
+                f"Matched rt/lowstate is stale: age={age:.3f}s, "
+                f"limit={float(max_age_sec):.3f}s"
+            )
+        return TimedJointState(nearest.host_monotonic_sec, dict(nearest.joints))
 
     def latest_joint_positions(self) -> Dict[str, float]:
         return {name: sample.q for name, sample in self.latest_state().items()}

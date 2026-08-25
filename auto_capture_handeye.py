@@ -28,9 +28,10 @@ from handeye_calib.solver import normalize_mode
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
-DEFAULT_URDF = PROJECT_ROOT / "robots" / "g1" / "g1_29dof_rev_1_0.urdf"
+DEFAULT_URDF = WORKSPACE_ROOT / "unitree_ros" / "robots" / "g1_description" / "g1_29dof_rev_1_0.urdf"
 
 ARM_SDK_WEIGHT = 29
 WAIST_JOINTS = [12, 13, 14]
@@ -227,7 +228,7 @@ class G1ArmSdkController:
 
 
 def load_fk_model(urdf: str):
-    robot_kinematics_dir = PROJECT_ROOT / "robot_kinematics"
+    robot_kinematics_dir = WORKSPACE_ROOT / "robot_kinematics"
     joint_to_pose_dir = robot_kinematics_dir / "joint_to_pose"
     for path in (robot_kinematics_dir, joint_to_pose_dir):
         if str(path) not in sys.path:

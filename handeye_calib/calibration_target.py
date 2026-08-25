@@ -25,6 +25,8 @@ def solve_target_pose(
     if hasattr(cv2, "solvePnPRefineLM"):
         rvec, tvec = cv2.solvePnPRefineLM(objp, corners, camera_matrix, dist_coeffs, rvec, tvec)
     projected, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
-    err = cv2.norm(corners, projected, cv2.NORM_L2) ** 2
-    rms = float(np.sqrt(err / len(projected)))
+    detected_xy = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+    projected_xy = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+    residual_xy = detected_xy - projected_xy
+    rms = float(np.sqrt(np.mean(np.sum(residual_xy * residual_xy, axis=1))))
     return rvec.reshape(3), tvec.reshape(3), rms

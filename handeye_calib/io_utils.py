@@ -9,6 +9,11 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
+from .intrinsics import (
+    discover_intrinsics_manifest,
+    file_sha256,
+    validate_intrinsics_manifest,
+)
 from .transforms import invert_transform, transform_from_rvec_tvec, transform_to_record
 
 
@@ -23,11 +28,27 @@ def load_camera_params(
             raise ValueError("--camera-matrix-npy 和 --dist-coeffs-npy 必须同时提供")
         camera_matrix = np.load(camera_matrix_npy).astype(np.float64)
         dist_coeffs = np.load(dist_coeffs_npy).reshape(-1, 1).astype(np.float64)
-        return camera_matrix, dist_coeffs, {
+        matrix_path = Path(camera_matrix_npy).resolve()
+        distortion_path = Path(dist_coeffs_npy).resolve()
+        info: dict[str, Any] = {
             "source": "npy",
-            "camera_matrix_npy": str(Path(camera_matrix_npy).resolve()),
-            "dist_coeffs_npy": str(Path(dist_coeffs_npy).resolve()),
+            "camera_matrix_npy": str(matrix_path),
+            "dist_coeffs_npy": str(distortion_path),
+            "camera_matrix_sha256": file_sha256(matrix_path),
+            "dist_coeffs_sha256": file_sha256(distortion_path),
+            "camera_matrix": camera_matrix.astype(float).tolist(),
+            "dist_coeffs": dist_coeffs.reshape(-1).astype(float).tolist(),
         }
+        try:
+            manifest_path = discover_intrinsics_manifest(matrix_path.parent)
+        except FileNotFoundError:
+            info["manifest_status"] = "legacy_missing"
+        else:
+            manifest = validate_intrinsics_manifest(manifest_path)
+            info["manifest_status"] = "validated"
+            info["manifest_path"] = str(manifest_path.resolve())
+            info["manifest"] = manifest
+        return camera_matrix, dist_coeffs, info
 
     if camera_json:
         path = Path(camera_json)
@@ -49,7 +70,13 @@ def load_camera_params(
         if isinstance(coeffs, dict):
             coeffs = [coeffs.get(k, 0.0) for k in ("k1", "k2", "p1", "p2", "k3")]
         dist_coeffs = np.asarray(coeffs, dtype=np.float64).reshape(-1, 1)
-        return camera_matrix, dist_coeffs, {"source": "json", "camera_json": str(path.resolve())}
+        return camera_matrix, dist_coeffs, {
+            "source": "json",
+            "camera_json": str(path.resolve()),
+            "camera_json_sha256": file_sha256(path),
+            "camera_matrix": camera_matrix.astype(float).tolist(),
+            "dist_coeffs": dist_coeffs.reshape(-1).astype(float).tolist(),
+        }
 
     return None
 
@@ -75,6 +102,9 @@ def save_capture_record(
     pose_units: dict[str, str],
     T_hand2base: np.ndarray,
     hand_frame_name: str,
+    base_frame_name: str = "base",
+    capture_timing: Optional[dict[str, Any]] = None,
+    fk_metadata: Optional[dict[str, Any]] = None,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -89,12 +119,16 @@ def save_capture_record(
     T_target2cam = transform_from_rvec_tvec(target_rvec, target_tvec)
     T_base2hand = invert_transform(T_hand2base)
     payload = {
+        "schema": "handeye_capture",
+        "schema_version": 2,
         "saved_at_utc": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
         "image": image_path.name,
         "camera_index": camera_index,
         "camera_info": camera_info,
         "camera_intrinsics": camera_intrinsics,
+        "capture_timing": dict(capture_timing or {}),
+        "fk_metadata": dict(fk_metadata or {}),
         "robot_context": robot_context,
         "board": {
             "inner_corners_cols": int(pattern_size[0]),
@@ -108,12 +142,17 @@ def save_capture_record(
         "target_reprojection_rms_px": float(target_reproj_rms),
         "hand_pose_input": {
             "frame_name": hand_frame_name,
+            "base_frame_name": base_frame_name,
             "raw": pose_text,
             "values": pose_values,
             "translation_unit": pose_units["translation"],
             "rotation_unit": pose_units["rotation"],
             "euler_order": pose_units["euler_order"],
-            "meaning": "T_base_hand: 点从灵巧手/末端坐标变换到机器人基座坐标",
+            "euler_convention": pose_units.get("euler_convention", "legacy_rxryrz"),
+            "meaning": (
+                f"T_{base_frame_name}_{hand_frame_name}: "
+                f"点从 {hand_frame_name} 坐标变换到 {base_frame_name} 坐标"
+            ),
         },
         "hand2base": transform_to_record(T_hand2base),
         "base2hand": transform_to_record(T_base2hand),

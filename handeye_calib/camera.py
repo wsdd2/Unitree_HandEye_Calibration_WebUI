@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 import re
+import time
 
 import numpy as np
 import cv2
@@ -144,11 +145,12 @@ class RealSenseD435i:
         self._config = None
         self._align = None
 
-    def fetch(self, timeout_ms: int = 3000) -> Optional[dict[str, np.ndarray]]: # 获取深度图和彩色图
+    def fetch(self, timeout_ms: int = 3000) -> Optional[dict[str, object]]: # 获取深度图和彩色图
         if not self._started or self._pipeline is None:
             raise RuntimeError("RealSenseD435i not started; call start() first")
         try:
             frames = self._pipeline.wait_for_frames(timeout_ms=timeout_ms)
+            host_monotonic_sec = time.monotonic()
         except RuntimeError:
             return None
         if frames is None:
@@ -174,13 +176,31 @@ class RealSenseD435i:
             raw_depth = np.asanyarray(depth_frame.get_data(), dtype=np.uint16)
             depth_mm = raw_depth.astype(np.float32) * self.depth_scale * 1000.0
             depth_mm = np.clip(depth_mm, 0, 65535).astype(np.uint16)
-        return {"rgb": np.ascontiguousarray(rgb), "depth": np.ascontiguousarray(depth_mm)}
+        return {
+            "rgb": np.ascontiguousarray(rgb),
+            "depth": np.ascontiguousarray(depth_mm),
+            "host_monotonic_sec": host_monotonic_sec,
+            "frame_timestamp_ms": float(color_frame.get_timestamp()),
+            "frame_timestamp_domain": str(color_frame.get_frame_timestamp_domain()),
+            "frame_number": int(color_frame.get_frame_number()),
+        }
 
     def color_intrinsics(self) -> tuple[np.ndarray, np.ndarray, dict]: # 获取相机内参
         if self._profile is None:
             raise RuntimeError("RealSense pipeline 尚未启动，无法读取内参")
         color_profile = self._profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_profile.get_intrinsics()
+        allowed_models = {
+            rs.distortion.none,
+            rs.distortion.brown_conrady,
+            rs.distortion.modified_brown_conrady,
+        }
+        if intr.model not in allowed_models:
+            allowed_names = "none, brown_conrady, modified_brown_conrady"
+            raise RuntimeError(
+                f"RealSense color distortion model {intr.model!s} is not OpenCV-compatible; "
+                f"supported models: {allowed_names}"
+            )
         camera_matrix = np.array(
             [[intr.fx, 0.0, intr.ppx], [0.0, intr.fy, intr.ppy], [0.0, 0.0, 1.0]],
             dtype=np.float64,
@@ -267,13 +287,18 @@ class OpenCVVideoCamera:
             "fps": int(self.fps),
         }
 
-    def fetch(self, timeout_ms: int = 3000) -> Optional[dict[str, np.ndarray]]:
+    def fetch(self, timeout_ms: int = 3000) -> Optional[dict[str, object]]:
         del timeout_ms
         if self._cap is None:
             raise RuntimeError("OpenCVVideoCamera not opened; call open() first")
         ok, frame_bgr = self._cap.read()
+        host_monotonic_sec = time.monotonic()
         if not ok or frame_bgr is None:
             return None
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
         depth = np.zeros(rgb.shape[:2], dtype=np.uint16)
-        return {"rgb": np.ascontiguousarray(rgb), "depth": depth}
+        return {
+            "rgb": np.ascontiguousarray(rgb),
+            "depth": depth,
+            "host_monotonic_sec": host_monotonic_sec,
+        }
