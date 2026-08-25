@@ -8,6 +8,10 @@ import cv2
 import numpy as np
 
 
+EULER_MODE_ROS_RPY = "ros_rpy_rzryrx"
+EULER_MODE_LEGACY_XYZ = "legacy_rxryrz"
+
+
 def parse_pose_text(text: str) -> list[float]:
     cleaned = text.strip().replace("[", " ").replace("]", " ").replace("(", " ").replace(")", " ")
     parts = [p for p in re.split(r"[,\s]+", cleaned) if p]
@@ -33,10 +37,26 @@ def axis_rotation(axis: str, angle_rad: float) -> np.ndarray:
 
 def euler_to_rotation(angles: list[float], order: str, unit: str) -> np.ndarray:
     vals = np.asarray(angles, dtype=np.float64)
+    if vals.shape != (3,):
+        raise ValueError("欧拉角必须恰好包含 3 个值")
     if unit == "deg":
         vals = np.deg2rad(vals)
+    elif unit != "rad":
+        raise ValueError(f"不支持的旋转单位: {unit}")
+    mode = order.strip().lower().replace("-", "_")
+    if mode in (EULER_MODE_ROS_RPY, "ros_rpy", "rpy"):
+        roll, pitch, yaw = vals
+        return (
+            axis_rotation("z", float(yaw))
+            @ axis_rotation("y", float(pitch))
+            @ axis_rotation("x", float(roll))
+        )
+    if mode in (EULER_MODE_LEGACY_XYZ, "legacy_xyz"):
+        mode = "xyz"
+    if len(mode) != 3 or set(mode) != {"x", "y", "z"}:
+        raise ValueError(f"不支持的欧拉角模式/顺序: {order}")
     rotation = np.eye(3, dtype=np.float64)
-    for axis, angle in zip(order.lower(), vals):
+    for axis, angle in zip(mode, vals):
         rotation = rotation @ axis_rotation(axis, float(angle))
     return rotation
 
@@ -85,12 +105,50 @@ def average_transforms(transforms: list[np.ndarray]) -> np.ndarray:
     if not transforms:
         return np.eye(4, dtype=np.float64)
     translations = np.asarray([t[:3, 3] for t in transforms], dtype=np.float64).mean(axis=0)
-    rvecs = []
+    # Markley 四元数平均不会在 Rodrigues 的 +/-pi 分支切面上相互抵消。
+    accumulator = np.zeros((4, 4), dtype=np.float64)
     for transform in transforms:
-        rvec, _ = cv2.Rodrigues(transform[:3, :3])
-        rvecs.append(rvec.reshape(3))
-    mean_rvec = np.asarray(rvecs, dtype=np.float64).mean(axis=0)
-    rotation, _ = cv2.Rodrigues(mean_rvec.reshape(3, 1))
+        rotation = np.asarray(transform[:3, :3], dtype=np.float64)
+        trace = float(np.trace(rotation))
+        if trace > 0.0:
+            s = np.sqrt(trace + 1.0) * 2.0
+            quat = np.array(
+                [
+                    0.25 * s,
+                    (rotation[2, 1] - rotation[1, 2]) / s,
+                    (rotation[0, 2] - rotation[2, 0]) / s,
+                    (rotation[1, 0] - rotation[0, 1]) / s,
+                ]
+            )
+        else:
+            index = int(np.argmax(np.diag(rotation)))
+            j, k = (index + 1) % 3, (index + 2) % 3
+            s = np.sqrt(max(0.0, 1.0 + rotation[index, index] - rotation[j, j] - rotation[k, k])) * 2.0
+            xyz = np.zeros(3, dtype=np.float64)
+            xyz[index] = 0.25 * s
+            xyz[j] = (rotation[j, index] + rotation[index, j]) / s
+            xyz[k] = (rotation[k, index] + rotation[index, k]) / s
+            quat = np.array(
+                [
+                    (rotation[k, j] - rotation[j, k]) / s,
+                    xyz[0],
+                    xyz[1],
+                    xyz[2],
+                ]
+            )
+        quat /= np.linalg.norm(quat)
+        accumulator += np.outer(quat, quat)
+    quat = np.linalg.eigh(accumulator)[1][:, -1]
+    quat /= np.linalg.norm(quat)
+    w, x, y, z = quat
+    rotation = np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
     out = np.eye(4, dtype=np.float64)
     out[:3, :3] = rotation
     out[:3, 3] = translations

@@ -35,8 +35,8 @@ def gamma_correct_bgr(image_bgr: np.ndarray, gamma: float) -> np.ndarray:
 
 
 def gray_variants(gray: np.ndarray, gamma: float) -> list[tuple[str, np.ndarray]]:
-    table = np.array([(i / 255.0) ** gamma * 255.0 for i in range(256)], dtype=np.uint8)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    table = np.array([(i / 255.0) ** gamma * 255.0 for i in range(256)], dtype=np.uint8) # Its principle is to adjust the brightness of the image
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) # This is used for improving the contrast of the image
     return [
         ("raw", gray),
         ("gamma", cv2.LUT(gray, table)),
@@ -96,7 +96,7 @@ def put_text_bgr_adaptive(
         fg, edge = ((28, 28, 28), (255, 255, 255)) if lum >= 130.0 else ((250, 250, 250), (0, 0, 0))
     font = cv2.FONT_HERSHEY_SIMPLEX
     outline = max(2, thickness + 2)
-    for du, dv in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)):
+    for du, dv in ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1)): # (+-1, +-1) means the text will be put in the surrounding of the original text
         cv2.putText(vis, text, (ox + du, oy + dv), font, font_scale, edge, outline, cv2.LINE_AA)
     cv2.putText(vis, text, (ox, oy), font, font_scale, fg, thickness, cv2.LINE_AA)
 

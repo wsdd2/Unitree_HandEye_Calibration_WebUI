@@ -12,6 +12,7 @@ import numpy as np
 
 from handeye_calib.calibration_target import build_object_points
 from handeye_calib.chessboard import find_chessboard_corners
+from handeye_calib.intrinsics import write_intrinsics_manifest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -39,8 +40,19 @@ def per_view_errors(
     errors: list[dict] = []
     for objp, corners, rvec, tvec, path in zip(object_points, image_points, rvecs, tvecs, image_paths):
         projected, _ = cv2.projectPoints(objp, rvec, tvec, camera_matrix, dist_coeffs)
-        error = cv2.norm(corners, projected, cv2.NORM_L2) / len(projected)
-        errors.append({"image": str(path), "mean_reprojection_error_px": float(error)})
+        detected_xy = np.asarray(corners, dtype=np.float64).reshape(-1, 2)
+        projected_xy = np.asarray(projected, dtype=np.float64).reshape(-1, 2)
+        residual_xy = detected_xy - projected_xy
+        point_errors = np.linalg.norm(residual_xy, axis=1)
+        errors.append(
+            {
+                "image": str(path),
+                "mean_reprojection_error_px": float(np.mean(point_errors)),
+                "rms_reprojection_error_px": float(
+                    np.sqrt(np.mean(point_errors * point_errors))
+                ),
+            }
+        )
     return errors
 
 
@@ -119,6 +131,15 @@ def calibrate(args: argparse.Namespace) -> int:
     dist_coeffs_path = npy_dir / "dist_coeffs.npy"
     np.save(camera_matrix_path, camera_matrix)
     np.save(dist_coeffs_path, dist_coeffs)
+    manifest_path = write_intrinsics_manifest(
+        npy_dir,
+        camera_matrix,
+        dist_coeffs,
+        image_size,
+        camera_serial=args.camera_serial,
+        camera_model=args.camera_model,
+        stream_name=args.stream_name,
+    )
 
     report = {
         "image_dir": str(image_dir),
@@ -131,6 +152,7 @@ def calibrate(args: argparse.Namespace) -> int:
         "dist_coeffs": dist_coeffs.reshape(-1).astype(float).tolist(),
         "camera_matrix_npy": str(camera_matrix_path),
         "dist_coeffs_npy": str(dist_coeffs_path),
+        "intrinsics_manifest": str(manifest_path),
         "per_view_errors": errors,
         "rejected": rejected,
     }
@@ -141,6 +163,7 @@ def calibrate(args: argparse.Namespace) -> int:
     print(f"[JSON] {report_path}")
     print(f"[NPY]  {camera_matrix_path}")
     print(f"[NPY]  {dist_coeffs_path}")
+    print(f"[MANIFEST] {manifest_path}")
     return 0
 
 
@@ -154,6 +177,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma", type=float, default=0.85)
     parser.add_argument("--min-images", type=int, default=8)
     parser.add_argument("--fix-k3", action="store_true", help="固定 k3 畸变项，样本较少时可尝试")
+    parser.add_argument("--camera-serial", default="", help="可选相机序列号，写入内参 manifest")
+    parser.add_argument("--camera-model", default="", help="可选相机型号，写入内参 manifest")
+    parser.add_argument("--stream-name", default="", help="可选视频流名称，写入内参 manifest")
     args = parser.parse_args()
     if args.cols < 2 or args.rows < 2:
         parser.error("--cols/--rows must be >= 2")
