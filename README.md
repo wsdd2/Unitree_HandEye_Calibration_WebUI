@@ -9,6 +9,8 @@
 - 采集时从 `rt/lowstate` 读取关节并做 **URDF 正运动学**
 - 可选 **右臂 waypoint**（`rt/arm_sdk`）辅助采集多样姿态
 - 离线对已保存 session 重新求解
+- **严格标定流水线**：内参覆盖率、采集同步、静止状态、闭环与子集稳定性门禁
+- 使用独立新姿态对 Eye-in-hand 外参做闭环及绝对位置验证
 - **H2 适配层**：虚拟末端 `R_ee`、腰关节锁定 FK
 
 ## 网页界面预览
@@ -41,9 +43,12 @@ unitree-handeye-calib/
 ├── solve_offline.py         # 离线重算
 ├── calibrate_camera.py      # 相机内参标定
 ├── auto_capture_handeye.py  # 自动采样本（可选）
+├── strict_calibration_pipeline.py      # 严格内参/手眼求解与双批次对比
+├── validate_eye_in_hand_absolute.py    # 独立姿态绝对位置验证
 ├── handeye_calib/           # 相机、棋盘格、求解器、网页服务
 ├── robot_kinematics/        # URDF FK + Unitree lowstate 桥接
 ├── h2/                      # H2 封装与 FK 诊断
+├── tests/                   # 严格流水线、求解器和采集安全测试
 ├── data/                    # 预设（采集数据默认不入库）
 ├── outputs/                 # 求解结果（不入库）
 └── robots/                  # 自行放置 URDF（仓库不附带）
@@ -134,6 +139,91 @@ http://<机器人主机IP>:8080/
 常用网页操作：**Save** 保存样本、**Solve** 求解、**Quit** 退出。  
 启用 `--enable-arm-waypoints` 后可用右臂关节滑条，详见 [docs/web_calibration.md](docs/web_calibration.md)。
 
+## 严格标定与部署门禁
+
+普通采集和求解适合调试；需要生成生产外参时，建议使用严格流程。严格流程默认要求：
+
+- 至少 24 组手眼样本，并包含充分的平移和旋转变化
+- 有来源清单的相机内参，且相机序列号和流分辨率一致
+- 图像与 FK 时间差不超过 30 ms，机器人状态年龄不超过 100 ms
+- 采集时机械臂近似静止，关节速度不超过 0.01 rad/s
+- 闭环误差、不同算法、数据拆分和随机子集结果均通过稳定性阈值
+
+### 1. 严格内参标定
+
+```bash
+python strict_calibration_pipeline.py intrinsics \
+  --image-dir <内参棋盘图像目录> \
+  --cols 11 --rows 8 --square-mm 20 \
+  --camera-serial <相机序列号>
+```
+
+命令会在 `outputs/` 下保存内参、来源信息和质量报告。只有输出显示
+`[INTRINSICS][PASS]` 时才应继续。
+
+### 2. 严格采集
+
+```bash
+python capture_handeye.py \
+  --mode eye-in-hand \
+  --strict-capture \
+  --min-samples 24 \
+  --camera-matrix-npy <内参结果目录>/camera_matrix.npy \
+  --dist-coeffs-npy <内参结果目录>/dist_coeffs.npy \
+  --cam-serial <相机序列号> \
+  --fk-urdf <机器人URDF> \
+  --fk-base-link torso_link \
+  --hand-frame right_wrist_yaw_link \
+  --fk-network-interface <DDS网卡> \
+  --fk-sync-max-delta-sec 0.03 \
+  --fk-max-state-age-sec 0.10 \
+  --capture-max-joint-velocity-rad-s 0.01 \
+  --cols 11 --rows 8 --square-mm 20
+```
+
+`--strict-capture` 会关闭采集程序内置的旧求解入口；采集完成后必须运行严格求解器。
+
+### 3. 严格手眼求解与双批次复现
+
+```bash
+python strict_calibration_pipeline.py handeye \
+  --data-dir <第一批采集目录> \
+  --mode eye-in-hand \
+  --camera-serial <相机序列号> \
+  --base-frame torso_link \
+  --hand-frame right_wrist_yaw_link
+
+python strict_calibration_pipeline.py handeye \
+  --data-dir <第二批独立采集目录> \
+  --mode eye-in-hand \
+  --camera-serial <相机序列号> \
+  --base-frame torso_link \
+  --hand-frame right_wrist_yaw_link
+
+python strict_calibration_pipeline.py compare \
+  --first <第一批严格求解JSON> \
+  --second <第二批严格求解JSON> \
+  --mode eye-in-hand
+```
+
+只有严格求解结果中 `deployable=true`，且两批独立结果对比通过时，才进入绝对验证。
+
+### 4. 独立新姿态绝对验证
+
+验证数据不得参与原手眼求解。若已通过独立测量获得棋盘参考点在
+`base/torso` 坐标系下的真值：
+
+```bash
+python validate_eye_in_hand_absolute.py \
+  --validation-data-dir <独立验证采集目录> \
+  --handeye-json <严格手眼结果JSON> \
+  --truth-xyz-m <X> <Y> <Z> \
+  --reference-point first-inner-corner
+```
+
+不提供 `--truth-xyz-m` 时只能检查多姿态闭环一致性，不能据此证明
+`torso_link` 下的绝对位置精度。
+
 ## H2（虚拟 R_ee + 锁腰）
 
 ```bash
@@ -174,6 +264,15 @@ python solve_offline.py --mode eye-in-hand --data-dir <session目录> --handeye-
 - `quality.rotation_error_deg_each`
 
 建议采集 **12～20** 组，包含明显的平移与旋转变化。
+
+严格部署流程应使用至少 **24** 组样本，并以严格流水线输出的
+`deployable`、`failures` 和独立绝对验证结果为准。
+
+## 测试
+
+```bash
+python -m pytest tests -q
+```
 
 ## 公开发布注意事项
 
