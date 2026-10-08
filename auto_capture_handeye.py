@@ -468,7 +468,12 @@ def wait_for_detected_frame(
         frame_bgr = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
         preview = gamma_correct_bgr(frame_bgr, gamma)
         gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-        corners, detect_method = find_chessboard_corners(gray, pattern_size, gamma)
+        corners, detect_method = find_chessboard_corners(
+            gray,
+            pattern_size,
+            gamma,
+            mode="preview",
+        )
         if corners is not None:
             cv2.drawChessboardCorners(preview, pattern_size, corners, True)
         if stream_server is not None:
@@ -528,7 +533,12 @@ def update_idle_stream(
     preview = gamma_correct_bgr(frame_bgr, args.gamma)
     gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
     pattern_size = (args.cols, args.rows)
-    corners, detect_method = find_chessboard_corners(gray, pattern_size, args.gamma)
+    corners, detect_method = find_chessboard_corners(
+        gray,
+        pattern_size,
+        args.gamma,
+        mode="preview",
+    )
     if corners is not None:
         cv2.drawChessboardCorners(preview, pattern_size, corners, True)
     cv2.putText(

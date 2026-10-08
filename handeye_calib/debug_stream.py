@@ -8,6 +8,8 @@ from typing import Any, Optional
 import cv2
 from flask import Flask, Response, jsonify, make_response, request
 
+from handeye_calib.sweep_web import SWEEP_QUEUE_MAX, SWEEP_STALE_SEC, normalize_sweep_command
+
 
 RIGHT_ARM_JOINT_UI = [
     ("right_shoulder_pitch", "肩 pitch"),
@@ -25,6 +27,7 @@ SIMPLE_COMMANDS = {
     "quit",
     "start_calib",
     "switch_sdk",
+    "next_camera",
     "test_move",
     "stop",
     "touch",
@@ -33,6 +36,7 @@ SIMPLE_COMMANDS = {
     "arm_next",
     "arm_move",
     "arm_random_right",
+    "arm_random_sweep",
     "arm_hold_current",
     "arm_save_current",
     "arm_release",
@@ -62,7 +66,100 @@ def _joint_control_rows_html() -> str:
           <button class="arm" onclick="sendJointCommand('arm_joint_random', '{joint_key}', 'delta_{joint_key}', this)">Rand</button>
         </div>"""
         )
-    return "".join(rows)
+        return "".join(rows)
+
+
+SWEEP_PANEL_HTML = """
+      <h2>扫掠 / 末端微调</h2>
+      <div id="sweep-status" class="hint sweep-wait">等待终端 B 接入…</div>
+      <div class="hint">终端 A 只负责预览和 Save。下面按钮要等终端 B 到位后才可点。</div>
+      <div id="sweep-panel" class="panel-disabled">
+      <div class="controls">
+        <button class="save" data-sweep disabled onclick="sendSweep('sweep_next', this)">下一个 n</button>
+        <button class="stop" data-sweep disabled onclick="sendSweep('sweep_skip', this)">再抽 s</button>
+        <button class="quit" data-sweep disabled onclick="sendSweep('sweep_quit', this)">结束 q</button>
+      </div>
+      <div class="hint">平移是躯干系：Z+ 向上抬（默认 20 mm），X/Y 默认 2 mm。旋转仍是相机系。当前 <span id="sweep-step">XY 2.0 mm / Z 20.0 mm / 2.0°</span></div>
+      <div class="jog-grid">
+        <span class="jog-label">X</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_x_plus', this)">X+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_x_minus', this)">X-</button>
+        <span class="jog-label">Y</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_y_plus', this)">Y+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_y_minus', this)">Y-</button>
+        <span class="jog-label">Z</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_z_plus', this)">Z+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_z_minus', this)">Z-</button>
+        <span class="jog-label">roll</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_roll_plus', this)">R+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_roll_minus', this)">R-</button>
+        <span class="jog-label">pitch</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_pitch_plus', this)">P+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_pitch_minus', this)">P-</button>
+        <span class="jog-label">yaw</span>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_yaw_plus', this)">Y+</button>
+        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_yaw_minus', this)">Y-</button>
+      </div>
+      <div class="controls">
+        <button class="mode" data-sweep disabled onclick="sendSweep('sweep_step_halve', this)">步长 /2</button>
+        <button class="mode" data-sweep disabled onclick="sendSweep('sweep_step_double', this)">步长 ×2</button>
+        <button class="test" data-sweep disabled onclick="sendSweep('sweep_follow', this)">跟随实测</button>
+      </div>
+      </div>
+"""
+
+SWEEP_PANEL_JS = """
+    async function sendSweep(command, btn) {
+      if (btn && btn.disabled) return;
+      pulseButton(btn);
+      const response = await fetch('/sweep/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command })
+      });
+      if (!response.ok) {
+        let detail = '';
+        try {
+          const data = await response.json();
+          detail = data.error || '';
+        } catch (error) {}
+        console.warn('sweep command rejected', command, detail);
+      }
+      refreshState();
+    }
+
+    function refreshSweepUi(sweep) {
+      const statusEl = document.getElementById('sweep-status');
+      const panel = document.getElementById('sweep-panel');
+      const stepEl = document.getElementById('sweep-step');
+      sweep = sweep || {};
+      const connected = !!sweep.connected;
+      const ready = !!sweep.accepts_input;
+      let text = '等待终端 B 接入…';
+      if (connected && ready) {
+        const goal = Number(sweep.target) > 0 ? sweep.target : '∞';
+        text = '终端 B 已就绪  已确认 ' + (sweep.accepted || 0) + '/' + goal;
+        if (sweep.message) text += '  ' + sweep.message;
+      } else if (connected) {
+        text = '终端 B 已连接，手臂移动中，到位后按钮可用';
+        if (sweep.message) text += '  ' + sweep.message;
+      }
+      if (statusEl) {
+        statusEl.textContent = text;
+        statusEl.className = ready ? 'hint sweep-ready' : (connected ? 'hint sweep-busy' : 'hint sweep-wait');
+      }
+      if (panel) panel.classList.toggle('panel-disabled', !ready);
+      document.querySelectorAll('[data-sweep]').forEach((btn) => {
+        btn.disabled = !ready;
+      });
+      if (stepEl && sweep.step_mm != null) {
+        stepEl.textContent =
+          'XY ' + Number(sweep.step_mm).toFixed(1) +
+          ' mm / Z ' + Number(sweep.z_step_mm || 20).toFixed(1) +
+          ' mm / ' + Number(sweep.rot_deg || 2).toFixed(1) + '°';
+      }
+    }
+"""
 
 
 class DebugStreamServer:
@@ -77,6 +174,9 @@ class DebugStreamServer:
         self._latest_jpeg: Optional[bytes] = None
         self._latest_state: dict[str, Any] = {}
         self._commands: list[dict[str, Any]] = []
+        self._sweep_commands: list[str] = []
+        self._sweep_status: dict[str, Any] = {}
+        self._sweep_heartbeat_at = 0.0
         self._started = False
         self._configure_routes()
 
@@ -92,7 +192,7 @@ class DebugStreamServer:
   <meta charset="utf-8">
   <title>Hand-Eye Debug Stream</title>
   <meta http-equiv="Cache-Control" content="no-store" />
-  <meta name="ui-version" content="20260626-capture-reject-alert" />
+  <meta name="ui-version" content="20260918-sweep-buttons" />
   <style>
     body {{ margin: 0; font-family: Arial, sans-serif; background: #111; color: #eee; }}
     .layout {{ display: flex; height: 100vh; }}
@@ -190,8 +290,35 @@ class DebugStreamServer:
     }}
     .hint {{ font-size: 12px; color: #888; margin-bottom: 8px; }}
     .hint-warn {{ font-size: 12px; color: #d9b26a; margin-bottom: 8px; line-height: 1.45; }}
+    .camera-box {{
+      margin: 0 0 12px;
+      padding: 10px 12px;
+      border: 1px solid #3a3a3a;
+      border-radius: 8px;
+      background: #151515;
+    }}
+    .camera-now {{ font-size: 14px; color: #9fd0ff; line-height: 1.4; margin-bottom: 6px; }}
+    .camera-list {{ font-size: 12px; color: #aaa; line-height: 1.45; white-space: pre-wrap; }}
     .panel-disabled {{ opacity: 0.42; pointer-events: none; filter: grayscale(0.15); }}
     .arm-sdk-row {{ pointer-events: auto; opacity: 1; filter: none; }}
+    button:disabled {{
+      opacity: 0.45;
+      cursor: not-allowed;
+      pointer-events: none;
+      box-shadow: none;
+      transform: none;
+    }}
+    .sweep-wait {{ color: #d9b26a; }}
+    .sweep-busy {{ color: #9fd0ff; }}
+    .sweep-ready {{ color: #7dce8a; }}
+    .jog-grid {{
+      display: grid;
+      grid-template-columns: 48px 1fr 1fr;
+      gap: 6px;
+      margin: 0 0 10px;
+      align-items: center;
+    }}
+    .jog-label {{ font-size: 12px; color: #aaa; }}
   </style>
 </head>
 <body>
@@ -199,6 +326,14 @@ class DebugStreamServer:
     <div class="video"><img src="/stream" /></div>
     <div class="panel">
       <h2>FK / Capture State</h2>
+      <div class="camera-box">
+        <div class="camera-now" id="camera-now">正在枚举 RealSense...</div>
+        <div class="controls" style="margin-bottom:8px">
+          <button class="mode" onclick="sendCommand('next_camera', this)">Next Camera</button>
+        </div>
+        <div class="camera-list" id="camera-list"></div>
+      </div>
+      {SWEEP_PANEL_HTML}
       <div class="controls">
         <button class="start" onclick="sendCommand('start_calib', this)">Start Calib</button>
         <button class="mode" onclick="sendCommand('switch_sdk', this)">Switch SDK Mode</button>
@@ -207,6 +342,10 @@ class DebugStreamServer:
         <button class="save" onclick="sendCommand('save', this)">Save / SPACE</button>
         <button class="solve" onclick="sendCommand('solve', this)">Solve / S</button>
         <button class="quit" onclick="sendCommand('quit', this)">Quit / Q</button>
+      </div>
+      <div class="camera-box" id="capture-box">
+        <div class="camera-now" id="capture-now">Save：画面上要先有绿角点</div>
+        <div class="camera-list" id="capture-path"></div>
       </div>
       <div id="arm-ui-root" style="display:none">
       <h2>Arm SDK</h2>
@@ -222,6 +361,7 @@ class DebugStreamServer:
         <button class="arm" onclick="sendCommand('arm_next', this)">Next</button>
         <button class="arm" onclick="sendCommand('arm_move', this)">Move</button>
         <button class="arm" onclick="sendCommand('arm_random_right', this)">Random Right Arm</button>
+        <button class="arm" onclick="sendCommand('arm_random_sweep', this)">Random Sweep 25</button>
         <button class="arm" onclick="sendCommand('arm_hold_current', this)">Hold Current</button>
         <button class="arm" onclick="sendCommand('arm_save_current', this)">Save Current</button>
         <button class="release" onclick="sendCommand('robot_default_pose', this)">Arm Default</button>
@@ -231,7 +371,7 @@ class DebugStreamServer:
       <div class="hint">Preset 回到 URDF 零位 (0 rad)；关节微调会累积，默认保持不 release</div>
       <div class="controls" id="preset-buttons"></div>
       <h2>Right Arm Joints</h2>
-      <div class="hint">Δ=相对当前角位移(rad)，Go=绝对目标(rad)，Rand=按 Δ 列幅度随机</div>
+      <div class="hint">Δ=相对当前角位移(rad)，Go=绝对目标(rad)，Rand=按 Δ 列幅度随机。Random Sweep 25=自动走 25 个上臂可达点，Stop 可中断</div>
       <div class="joint-grid">
         <div class="joint-head">
           <span>关节</span><span>Δ rad</span><span>Go rad</span><span></span><span></span><span></span>
@@ -273,6 +413,8 @@ class DebugStreamServer:
       document.addEventListener('pointerup', clearPressingButtons);
       document.addEventListener('pointercancel', clearPressingButtons);
     }}
+
+    {SWEEP_PANEL_JS}
 
     async function sendCommand(command, btn) {{
       pulseButton(btn);
@@ -378,6 +520,30 @@ class DebugStreamServer:
 
     let lastWarningId = 0;
 
+    function refreshCameraUi(data) {{
+      const nowEl = document.getElementById('camera-now');
+      const listEl = document.getElementById('camera-list');
+      if (!nowEl || !listEl) return;
+      const cam = (data && data.camera) || {{}};
+      const serial = cam.serial || cam.selected_serial || '?';
+      const model = cam.model || 'RealSense';
+      const idx = Number(cam.device_index);
+      const total = Number(cam.device_count);
+      const slot = Number.isFinite(idx) && Number.isFinite(total) && total > 0
+        ? `  (${{idx + 1}}/${{total}})`
+        : '';
+      nowEl.textContent = `当前相机: ${{model}}  SN=${{serial}}${{slot}}`;
+      const devices = Array.isArray(cam.enumerated) ? cam.enumerated : [];
+      if (!devices.length) {{
+        listEl.textContent = '未枚举到 RealSense。检查 USB / pyrealsense2。';
+        return;
+      }}
+      listEl.textContent = devices.map((dev, i) => {{
+        const mark = (dev.serial || '') === serial ? '> ' : '  ';
+        return `${{mark}}${{i + 1}}. ${{dev.model || 'RealSense'}}  SN=${{dev.serial || '?'}}`;
+      }}).join('\\n');
+    }}
+
     function maybeShowWarning(data) {{
       const warning = data && data.warning;
       if (!warning || !warning.id || warning.id === lastWarningId) return;
@@ -389,9 +555,27 @@ class DebugStreamServer:
           `上限: ${{Number(warning.max_reprojection_rms_px).toFixed(3)}} px\\n\\n` +
           '请等手臂/本体稳定、调整棋盘位置后重新 Save。'
         );
+      }} else if (warning.kind === 'capture_rejected_no_board') {{
+        alert('本次 Save 没存上：没检出棋盘。\\n画面上要先看到绿角点，并核对网页里的 board 尺寸。');
       }} else if (warning.message) {{
         alert(warning.message);
       }}
+    }}
+
+    function refreshCaptureUi(data) {{
+      const nowEl = document.getElementById('capture-now');
+      const pathEl = document.getElementById('capture-path');
+      if (!nowEl || !pathEl) return;
+      const found = !!data.chessboard_detected;
+      const saved = Number(data.saved_count || 0);
+      const msg = data.last_message || '';
+      nowEl.textContent = found
+        ? `棋盘已检出  已存 ${{saved}} 张  ${{msg}}`
+        : `棋盘未检出，Save 不会存图  已存 ${{saved}} 张  ${{msg}}`;
+      nowEl.style.color = found ? '#7dce8a' : '#d9b26a';
+      pathEl.textContent = data.session_dir
+        ? ('保存目录: ' + data.session_dir)
+        : '';
     }}
 
     async function refreshState() {{
@@ -399,6 +583,8 @@ class DebugStreamServer:
         const response = await fetch('/state', {{ cache: 'no-store' }});
         const data = await response.json();
         document.getElementById('state').textContent = JSON.stringify(data, null, 2);
+        refreshCameraUi(data);
+        refreshCaptureUi(data);
         maybeShowWarning(data);
         if (data.arm_waypoints && data.arm_waypoints.current_joints_rad) {{
           const joints = data.arm_waypoints.current_joints_rad;
@@ -411,6 +597,7 @@ class DebugStreamServer:
         }}
         refreshPresetButtons(data.arm_waypoints || {{}});
         refreshArmSdkUi(data.arm_waypoints || {{}});
+        refreshSweepUi(data.sweep || {{}});
       }} catch (error) {{
         document.getElementById('state').textContent = String(error);
       }}
@@ -439,7 +626,41 @@ class DebugStreamServer:
         def state() -> Response:
             with self._lock:
                 payload = dict(self._latest_state)
+                payload["sweep"] = self._sweep_public_unlocked()
             return jsonify(payload)
+
+        @self._app.route("/sweep/heartbeat", methods=["POST"])
+        def sweep_heartbeat() -> Response:
+            payload = request.get_json(silent=True) or {}
+            if not isinstance(payload, dict):
+                return jsonify({"ok": False, "error": "heartbeat must be an object"}), 400
+            with self._lock:
+                self._sweep_status = dict(payload)
+                self._sweep_heartbeat_at = time.time()
+            return jsonify({"ok": True, "sweep": self.sweep_public()})
+
+        @self._app.route("/sweep/command", methods=["GET", "POST"])
+        def sweep_command() -> Response:
+            if request.method == "GET":
+                with self._lock:
+                    cmd = self._sweep_commands.pop(0) if self._sweep_commands else None
+                return jsonify({"ok": True, "command": cmd})
+            payload = request.get_json(silent=True) or {}
+            cmd = normalize_sweep_command(payload.get("command"))
+            if cmd is None:
+                return jsonify({"ok": False, "error": "unsupported sweep command"}), 400
+            with self._lock:
+                if not self._sweep_connected_unlocked():
+                    return jsonify({"ok": False, "error": "sweep client not connected"}), 409
+                if not bool(self._sweep_status.get("accepts_input")):
+                    return jsonify({"ok": False, "error": "sweep not accepting input yet"}), 409
+                if len(self._sweep_commands) >= SWEEP_QUEUE_MAX:
+                    return jsonify({"ok": False, "error": "sweep command queue full"}), 429
+                self._sweep_commands.append(cmd)
+                self._latest_state = dict(self._latest_state)
+                self._latest_state["last_sweep_command"] = cmd
+                self._latest_state["last_sweep_command_at"] = time.time()
+            return jsonify({"ok": True, "command": cmd})
 
         @self._app.route("/command", methods=["POST"])
         def command() -> Response:
@@ -513,6 +734,45 @@ class DebugStreamServer:
             if not self._commands:
                 return None
             return self._commands.pop(0)
+
+    def sweep_public(self) -> dict[str, Any]:
+        with self._lock:
+            return self._sweep_public_unlocked()
+
+    def _sweep_connected_unlocked(self) -> bool:
+        return self._sweep_heartbeat_at > 0 and (time.time() - self._sweep_heartbeat_at) < SWEEP_STALE_SEC
+
+    def _sweep_public_unlocked(self) -> dict[str, Any]:
+        connected = self._sweep_connected_unlocked()
+        status = dict(self._sweep_status) if connected else {}
+
+        def _as_int(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_float(value: Any, default: float) -> float:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        return {
+            "connected": connected,
+            "accepts_input": bool(connected and status.get("accepts_input")),
+            "phase": str(status.get("phase") or ""),
+            "accepted": _as_int(status.get("accepted")),
+            "target": _as_int(status.get("target")),
+            "visits": _as_int(status.get("visits")),
+            "step_mm": _as_float(status.get("step_mm"), 2.0),
+            "z_step_mm": _as_float(status.get("z_step_mm"), 20.0),
+            "rot_deg": _as_float(status.get("rot_deg"), 2.0),
+            "xyz": status.get("xyz"),
+            "rpy_deg": status.get("rpy_deg"),
+            "message": str(status.get("message") or ""),
+            "queued": len(self._sweep_commands),
+        }
 
     @staticmethod
     def command_name(payload: Optional[dict[str, Any]]) -> Optional[str]:

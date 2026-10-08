@@ -121,3 +121,30 @@ Example entry:
 - By default, Move/Random auto-release SDK after settling; use
   `--no-arm-release-after-move` to hold until manual release.
 - No leg/locomotion controls are exposed in the web UI.
+
+## 7. H2 Upper-Arm Sweep
+
+`random_upper_arm_sweep.py` is a second process. It heartbeats to this page
+and receives the sweep buttons. Point `--web-url` at the same host and port
+as `--stream-port`.
+
+| Control | Description |
+|---------|-------------|
+| 下一个 n | Accept the current pose and move to the next sampled pose |
+| 再抽 s | Reject the pose and sample another one |
+| 结束 q | Stop the sweep |
+| X/Y/Z | Translate in the torso frame. Z is up |
+| R/P/Y | Rotate in the camera frame |
+| 步长 /2, ×2 | Change the jog step |
+| 跟随实测 | Reset the IK seed from the measured joints |
+
+The sweep process is what publishes `rt/arm_sdk` for these buttons. Do not
+also enable Arm Waypoints on the capture page at the same time.
+
+Without `--confirm-robot-motion`, the sweep script only writes a YAML file.
+`--mode dwell` waits at each pose. `--mode multi` runs the whole list without
+waiting. Default sampling moves the shoulder and elbow only; add
+`--include-wrist` when the wrist must move.
+
+Gravity feedforward is on by default. Set `--wrist-payload-kg` from the
+actual gripper and camera mass, or pass `--no-gravity` to send zero torque.

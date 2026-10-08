@@ -109,3 +109,11 @@ python3 compare_h2_fk.py \
   --h2-root <PATH_TO_H2_joint_cartesian> \
   --lock-waist
 ```
+
+## Upper-Arm Sweep
+
+Moving the H2 arm through capture poses is a separate program at the
+repository root, `random_upper_arm_sweep.py`. It is not part of this wrapper.
+Run the capture page in one terminal and the sweep script in another, and do
+not let both publish `rt/arm_sdk`. See the root README section
+「H2 上臂扫掠与末端点动」.

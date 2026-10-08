@@ -207,7 +207,51 @@ def main() -> int:
         filtering=filtering,
     )
     print(f"[DONE] saved: {path.resolve()}")
+    _print_orientation_summary(json.loads(path.read_text(encoding="utf-8")))
     return 0
+
+
+def _print_orientation_summary(payload: dict) -> None:
+    record = payload.get("cam2hand") or payload.get("cam2base") or {}
+    rotation = record.get("rotation_matrix")
+    translation = record.get("tvec_m")
+    if rotation is None or translation is None:
+        return
+    import math
+
+    r00, r10, r20 = rotation[0][0], rotation[1][0], rotation[2][0]
+    r21, r22 = rotation[2][1], rotation[2][2]
+    pitch = math.atan2(-r20, math.sqrt(r00 * r00 + r10 * r10))
+    if abs(math.cos(pitch)) > 1e-8:
+        roll = math.atan2(r21, r22)
+        yaw = math.atan2(r10, r00)
+    else:
+        roll = 0.0
+        yaw = math.atan2(-rotation[0][1], rotation[1][1])
+    xyz_mm = [1000.0 * float(v) for v in translation]
+    rpy_deg = [math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
+    cam_x = [rotation[0][0], rotation[1][0], rotation[2][0]]
+    cam_y = [rotation[0][1], rotation[1][1], rotation[2][1]]
+    cam_z = [rotation[0][2], rotation[1][2], rotation[2][2]]
+    quality = payload.get("quality") or {}
+    print(
+        "[ORIENT] "
+        f"xyz_mm=[{xyz_mm[0]:.1f}, {xyz_mm[1]:.1f}, {xyz_mm[2]:.1f}] "
+        f"rpy_deg=[{rpy_deg[0]:.1f}, {rpy_deg[1]:.1f}, {rpy_deg[2]:.1f}]"
+    )
+    print(
+        "[ORIENT] camera axes in hand/base: "
+        f"X=[{cam_x[0]:+.3f}, {cam_x[1]:+.3f}, {cam_x[2]:+.3f}] "
+        f"Y=[{cam_y[0]:+.3f}, {cam_y[1]:+.3f}, {cam_y[2]:+.3f}] "
+        f"Z(optical)=[{cam_z[0]:+.3f}, {cam_z[1]:+.3f}, {cam_z[2]:+.3f}]"
+    )
+    if "translation_residual_norm_mean_m" in quality:
+        print(
+            "[QUALITY] "
+            f"closure_mean_mm={1000.0 * float(quality['translation_residual_norm_mean_m']):.1f} "
+            f"closure_mean_deg={float(quality.get('rotation_error_deg_mean', 0.0)):.2f} "
+            "(approximate only; not for PBVS)"
+        )
 
 
 if __name__ == "__main__":

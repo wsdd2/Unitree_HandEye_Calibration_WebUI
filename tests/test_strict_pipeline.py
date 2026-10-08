@@ -65,8 +65,8 @@ def strict_records(count: int = 30) -> tuple[list[dict], np.ndarray]:
                 "image": f"{index:03d}.jpg",
                 "_json_path": f"/tmp/{index:03d}.json",
                 "camera_info": {
-                    "serial": "346522074739",
-                    "selected_serial": "346522074739",
+                    "serial": "000000000001",
+                    "selected_serial": "000000000001",
                     "width": 1280,
                     "height": 720,
                 },
@@ -124,7 +124,7 @@ class StrictPipelineTests(unittest.TestCase):
                 subset_trials=20,
                 subset_fraction=0.70,
             ),
-            expected_serial="346522074739",
+            expected_serial="000000000001",
             expected_size=(1280, 720),
             expected_base_frame="torso_link",
             expected_hand_frame="right_wrist_yaw_link",
@@ -139,7 +139,7 @@ class StrictPipelineTests(unittest.TestCase):
         report = validate_capture_preflight(
             records,
             thresholds=CaptureThresholds(),
-            expected_serial="346522074739",
+            expected_serial="000000000001",
             expected_size=(1280, 720),
             expected_base_frame="torso_link",
             expected_hand_frame="right_wrist_yaw_link",
@@ -158,7 +158,7 @@ class StrictPipelineTests(unittest.TestCase):
         report = validate_capture_preflight(
             records,
             thresholds=CaptureThresholds(),
-            expected_serial="346522074739",
+            expected_serial="000000000001",
             expected_size=(1280, 720),
             expected_base_frame="torso_link",
             expected_hand_frame="right_wrist_yaw_link",

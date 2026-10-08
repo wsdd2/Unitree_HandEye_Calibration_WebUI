@@ -562,7 +562,12 @@ def run(args: argparse.Namespace) -> int:
             frame_bgr = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
             preview = gamma_correct_bgr(frame_bgr, args.gamma)
             gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-            corners, detect_method = find_chessboard_corners(gray, pattern_size, args.gamma)
+            corners, detect_method = find_chessboard_corners(
+                gray,
+                pattern_size,
+                args.gamma,
+                mode="preview",
+            )
 
             rvec = None
             tvec = None

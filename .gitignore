@@ -11,3 +11,10 @@ camera_calib_image/
 handeye_img/
 *.npy
 !robot_kinematics/example/*.json
+
+# Field notes. IPs, accounts, camera serials, and solved extrinsics stay local.
+H2_HANDEYE_START_COMMANDS.txt
+H2_EYE_*.md
+STRICT_CALIBRATION_FLOW.md
+calib_readme.md
+handeye_calib/progress.md

@@ -3,18 +3,158 @@ from __future__ import annotations
 
 from typing import Optional
 import re
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import cv2
 
-try:
-    import pyrealsense2 as rs
-except ImportError as exc:  # pragma: no cover - depends on local hardware package
-    rs = None
-    _IMPORT_ERROR = exc
-else:
-    _IMPORT_ERROR = None
+
+def _is_usable_rs(module) -> bool:
+    return bool(module) and (
+        (hasattr(module, "context") or hasattr(module, "Context"))
+        and hasattr(module, "pipeline")
+    )
+
+
+def _purge_rs_modules() -> None:
+    for name in list(sys.modules):
+        if name == "pyrealsense2" or name.startswith("pyrealsense2."):
+            del sys.modules[name]
+
+
+def _user_site_path() -> Optional[str]:
+    try:
+        import site
+
+        user = site.getusersitepackages()
+    except Exception:
+        return None
+    return user if user else None
+
+
+def _strip_user_site() -> Optional[str]:
+    """Temporarily drop ~/.local so pip's empty pyrealsense2 stub cannot win."""
+    user = _user_site_path()
+    if not user:
+        return None
+    sys.path[:] = [item for item in sys.path if item != user]
+    return user
+
+
+def _restore_user_site(user: Optional[str]) -> None:
+    """Put user site back at the end so Flask etc. still import."""
+    if user and user not in sys.path:
+        sys.path.append(user)
+
+
+def _bind_search_dirs() -> list[Path]:
+    home = Path.home()
+    dirs: list[Path] = [
+        Path("/usr/lib/python3/dist-packages"),
+        Path("/usr/lib/python3/dist-packages/pyrealsense2"),
+        Path("/usr/local/lib/python3/dist-packages"),
+        home / "librealsense" / "build" / "wrappers" / "python",
+        home / "librealsense" / "build" / "Release",
+        Path("/opt/realsense/lib"),
+    ]
+    for root in (
+        Path("/usr/lib"),
+        Path("/usr/local/lib"),
+        home / "anaconda3",
+        home / "miniconda3",
+        Path("/opt"),
+    ):
+        if not root.exists():
+            continue
+        dirs.extend(sorted(root.glob("python3.*/dist-packages")))
+        dirs.extend(sorted(root.glob("python3.*/site-packages")))
+        dirs.extend(sorted(root.glob("envs/*/lib/python*/site-packages")))
+    try:
+        import shutil
+
+        binary = shutil.which("rs-enumerate-devices")
+        if binary:
+            prefix = Path(binary).resolve().parent.parent
+            dirs.append(prefix / "lib" / "python3" / "dist-packages")
+            dirs.extend(sorted((prefix / "lib").glob("python3.*/dist-packages")))
+            dirs.extend(sorted((prefix / "lib").glob("python3.*/site-packages")))
+    except Exception:
+        pass
+    out: list[Path] = []
+    seen: set[str] = set()
+    for item in dirs:
+        folder = item.parent if item.suffix == ".so" else item
+        key = str(folder)
+        if key in seen or not folder.is_dir():
+            continue
+        if not (folder / "pyrealsense2").exists() and not list(folder.glob("pyrealsense2*.so")):
+            continue
+        seen.add(key)
+        out.append(folder)
+    return out
+
+
+def _load_pyrealsense2():
+    """Skip pip stubs; prefer librealsense bindings that actually have pipeline."""
+    user = _strip_user_site()
+    try:
+        try:
+            import pyrealsense2 as module
+        except ImportError as exc:
+            module, first_error = None, exc
+        else:
+            first_error = None
+            if _is_usable_rs(module):
+                return module, None
+            try:
+                import pyrealsense2.pyrealsense2 as inner
+            except ImportError:
+                inner = None
+            if _is_usable_rs(inner):
+                return inner, None
+        for folder in _bind_search_dirs():
+            try:
+                path = str(folder)
+                if path in sys.path:
+                    sys.path.remove(path)
+                sys.path.insert(0, path)
+                _purge_rs_modules()
+                import pyrealsense2 as candidate
+            except Exception:
+                continue
+            if _is_usable_rs(candidate):
+                print(f"[CAMERA] using pyrealsense2 from {folder}")
+                return candidate, None
+            try:
+                import pyrealsense2.pyrealsense2 as inner
+            except Exception:
+                continue
+            if _is_usable_rs(inner):
+                print(f"[CAMERA] using pyrealsense2.pyrealsense2 from {folder}")
+                return inner, None
+        return None, first_error or RuntimeError(
+            "当前 python 里的 pyrealsense2 是空壳（没有 context/pipeline）。"
+            "不要 pip install pyrealsense2。请在机上找 rs-enumerate-devices 或 pyrealsense2*.so，"
+            "把其所在目录加入 PYTHONPATH。"
+        )
+    finally:
+        _restore_user_site(user)
+
+
+rs, _IMPORT_ERROR = _load_pyrealsense2()
+
+
+def _rs_context():
+    if not _is_usable_rs(rs):
+        raise RuntimeError(
+            "未找到可用的 librealsense Python 绑定。"
+            "在 H2 上执行: which rs-enumerate-devices; find /usr /opt /home/unitree -name 'pyrealsense2*.so'"
+            f" 错误={_IMPORT_ERROR}"
+        ) from _IMPORT_ERROR
+    factory = getattr(rs, "context", None) or getattr(rs, "Context", None)
+    return factory()
 
 
 class RealSenseD435i:
@@ -31,8 +171,12 @@ class RealSenseD435i:
         mount: str = "",
         color_only: bool = False,
     ) -> None:
-        if rs is None:
-            raise RuntimeError("未安装 pyrealsense2，请运行: pip install pyrealsense2") from _IMPORT_ERROR
+        if not _is_usable_rs(rs):
+            raise RuntimeError(
+                "未找到可用的 librealsense Python 绑定（当前 pyrealsense2 是空壳）。"
+                "不要 pip install pyrealsense2。"
+                f" 错误={_IMPORT_ERROR}"
+            ) from _IMPORT_ERROR
         self.index = index
         self.serial = serial.strip()
         self.camera_name = camera_name.strip()
@@ -53,7 +197,7 @@ class RealSenseD435i:
         if rs is None:
             return []
         devices = []
-        for i, dev in enumerate(rs.context().query_devices()):
+        for i, dev in enumerate(_rs_context().query_devices()):
             serial = dev.get_info(rs.camera_info.serial_number) if dev.supports(rs.camera_info.serial_number) else ""
             name = dev.get_info(rs.camera_info.name) if dev.supports(rs.camera_info.name) else "RealSense"
             firmware = dev.get_info(rs.camera_info.firmware_version) if dev.supports(rs.camera_info.firmware_version) else ""
@@ -62,12 +206,35 @@ class RealSenseD435i:
         return devices
 
     @staticmethod
+    def cycle_listed_device(
+        devices: list[dict],
+        current_serial: str = "",
+    ) -> dict:
+        """Pick the next RealSense in the enumerated list, wrapping around."""
+        if not devices:
+            raise RuntimeError("没有枚举到 RealSense 相机")
+        serials = [str(item.get("serial") or "").strip() for item in devices]
+        current = str(current_serial or "").strip()
+        if current in serials:
+            nxt = (serials.index(current) + 1) % len(serials)
+        else:
+            nxt = 0
+        return dict(devices[nxt])
+
+    @staticmethod
+    def format_device_label(device: dict | None) -> str:
+        info = device or {}
+        model = str(info.get("model") or "RealSense")
+        serial = str(info.get("serial") or info.get("selected_serial") or "?")
+        return f"{model}  SN={serial}"
+
+    @staticmethod
     def set_emitter(active_index: Optional[int], active_serial: str = "") -> None:
         """Enable the emitter for one camera and disable it for the others."""
         if rs is None:
             return
         active_serial = active_serial.strip()
-        for idx, dev in enumerate(rs.context().query_devices()):
+        for idx, dev in enumerate(_rs_context().query_devices()):
             try:
                 serial = dev.get_info(rs.camera_info.serial_number) if dev.supports(rs.camera_info.serial_number) else ""
                 is_active = bool(active_serial and serial == active_serial) or (not active_serial and active_index == idx)
@@ -190,13 +357,20 @@ class RealSenseD435i:
             raise RuntimeError("RealSense pipeline 尚未启动，无法读取内参")
         color_profile = self._profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_profile.get_intrinsics()
+        # D435/D435i color is factory-tagged inverse_brown_conrady.
+        # Same 5 Brown-Conrady coeffs; OpenCV undistort/solvePnP is the inverse map.
         allowed_models = {
-            rs.distortion.none,
-            rs.distortion.brown_conrady,
-            rs.distortion.modified_brown_conrady,
+            model
+            for model in (
+                getattr(rs.distortion, "none", None),
+                getattr(rs.distortion, "brown_conrady", None),
+                getattr(rs.distortion, "modified_brown_conrady", None),
+                getattr(rs.distortion, "inverse_brown_conrady", None),
+            )
+            if model is not None
         }
         if intr.model not in allowed_models:
-            allowed_names = "none, brown_conrady, modified_brown_conrady"
+            allowed_names = "none, brown_conrady, modified_brown_conrady, inverse_brown_conrady"
             raise RuntimeError(
                 f"RealSense color distortion model {intr.model!s} is not OpenCV-compatible; "
                 f"supported models: {allowed_names}"

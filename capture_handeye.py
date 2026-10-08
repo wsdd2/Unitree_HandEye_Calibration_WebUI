@@ -31,6 +31,7 @@ from handeye_calib.calibration_target import build_object_points, solve_target_p
 from handeye_calib.chessboard import (
     find_chessboard_corners,
     gamma_correct_bgr,
+    preview_detect_due,
     put_text_bgr_adaptive,
 )
 from handeye_calib.debug_stream import DebugStreamServer
@@ -43,6 +44,7 @@ from handeye_calib.transforms import (
     parse_pose_text,
     pose_to_transform,
 )
+from handeye_calib.upper_arm_sweep import rad_to_deg, sample_reachable_poses
 from handeye_calib.validation import mount_mode_mismatch
 
 
@@ -51,15 +53,9 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_ARM_PRESETS_JSON = PROJECT_ROOT / "data" / "arm_presets.json"
-DEFAULT_WRIST_CAM_SERIAL = "349622074791"
-DEFAULT_HEAD_CAM_SERIAL = "254322072703"
-DEFAULT_FK_URDF = (
-    WORKSPACE_ROOT
-    / "unitree_ros"
-    / "robots"
-    / "h2_description"
-    / "H2.urdf"
-)
+DEFAULT_WRIST_CAM_SERIAL = ""
+DEFAULT_HEAD_CAM_SERIAL = ""
+DEFAULT_FK_URDF = PROJECT_ROOT / "robots" / "h2" / "H2.urdf"
 DEFAULT_ARM_SIDE = "right"
 DEFAULT_BASE_FRAME = "torso_link"
 DEFAULT_HAND_FRAMES = {
@@ -821,6 +817,69 @@ def single_joint_target_q(
     return target_q, delta, was_clamped, clamped
 
 
+def run_random_upper_arm_sweep(
+    controller: "G1ArmWaypointController",
+    arm_session: ArmSessionState,
+    args: argparse.Namespace,
+    arm_joint_limits: dict[str, tuple[Optional[float], Optional[float]]],
+    loop_control: Optional[LoopControl],
+) -> tuple[str, dict[str, float], dict[str, dict[str, float]]]:
+    """Visit 20-30 reachable upper-arm poses instead of one keyboard/random nudge."""
+    current_q = arm_session.base_q(controller)
+    seed_deg = rad_to_deg([current_q[joint] for joint in RIGHT_ARM_JOINTS])
+    count = int(args.arm_random_sweep_count)
+    poses = sample_reachable_poses(
+        count,
+        arm="right",
+        seed_deg=seed_deg,
+        upper_arm_only=not bool(args.arm_random_sweep_include_wrist),
+        return_to_seed=True,
+        rng=random.Random(),
+    )
+    last_deltas: dict[str, float] = {}
+    last_clamped: dict[str, dict[str, float]] = {}
+    completed = 0
+    for index, pose in enumerate(poses, start=1):
+        if loop_control is not None:
+            loop_control.poll_web()
+            pending, command = loop_control.take_web_command()
+            if loop_control.quit_requested:
+                raise ArmMotionAborted()
+            if command == "stop":
+                return (
+                    f"random sweep stopped after {completed}/{len(poses)} poses",
+                    last_deltas,
+                    last_clamped,
+                )
+            if pending is not None and command not in {None, "stop", "arm_random_sweep"}:
+                loop_control._pending_payload = pending
+                loop_control._pending_command = command
+        start_q = arm_session.base_q(controller)
+        target_q = dict(start_q)
+        for joint, deg in zip(RIGHT_ARM_JOINTS, pose.deg):
+            target_q[joint] = float(np.deg2rad(deg))
+        target_q, last_clamped = clamp_right_arm_target_q(
+            target_q, arm_joint_limits, args.arm_limit_margin_rad
+        )
+        last_deltas = {
+            INDEX_TO_G1_ARM_JOINT[joint].replace("_joint", ""): target_q[joint] - start_q[joint]
+            for joint in RIGHT_ARM_JOINTS
+        }
+        prefix = f"sweep {index}/{len(poses)} {pose.name}"
+        print(f"[ARM] {prefix}: {last_deltas}")
+        execute_arm_motion(
+            controller,
+            target_q,
+            args,
+            prefix,
+            arm_session,
+            start_q=start_q,
+            loop_control=loop_control,
+        )
+        completed += 1
+    return f"random sweep done {completed} poses", last_deltas, last_clamped
+
+
 def execute_arm_motion(
     controller: G1ArmWaypointController,
     target_q: dict[int, float],
@@ -931,6 +990,94 @@ def make_no_camera_placeholder(width: int, height: int, lines: list[str]) -> np.
     return frame
 
 
+def print_enumerated_cameras(devices: list[dict[str, Any]], current_serial: str = "") -> None:
+    if not devices:
+        print("[CAMERA] enumerated 0 RealSense devices")
+        return
+    print(f"[CAMERA] enumerated {len(devices)} RealSense device(s):")
+    current = str(current_serial or "").strip()
+    for index, device in enumerate(devices, start=1):
+        mark = "*" if str(device.get("serial") or "") == current else " "
+        print(
+            f"[CAMERA] {mark} {index}/{len(devices)} "
+            f"model={device.get('model') or 'RealSense'} "
+            f"serial={device.get('serial') or '?'}"
+        )
+
+
+def attach_enumerated_camera_info(info: dict[str, Any], devices: list[dict[str, Any]]) -> dict[str, Any]:
+    payload = dict(info or {})
+    serial = str(payload.get("serial") or payload.get("selected_serial") or "").strip()
+    payload["enumerated"] = [dict(item) for item in devices]
+    payload["device_count"] = len(devices)
+    payload["device_index"] = next(
+        (index for index, item in enumerate(devices) if str(item.get("serial") or "") == serial),
+        0,
+    )
+    for item in devices:
+        if str(item.get("serial") or "") == serial:
+            payload.setdefault("model", item.get("model") or "RealSense")
+            payload.setdefault("firmware", item.get("firmware") or "")
+            payload["serial"] = serial
+            payload["selected_serial"] = serial
+            break
+    payload["label"] = RealSenseD435i.format_device_label(payload)
+    return payload
+
+
+def live_intrinsics_from_camera(cam: RealSenseD435i) -> tuple[np.ndarray, np.ndarray, dict]:
+    camera_matrix, dist_coeffs, info = cam.color_intrinsics()
+    info["source"] = "realsense_profile"
+    info["camera_matrix"] = camera_matrix.astype(float).tolist()
+    info["dist_coeffs"] = dist_coeffs.reshape(-1).astype(float).tolist()
+    return camera_matrix, dist_coeffs, info
+
+
+def switch_to_next_realsense(
+    cam: Optional[RealSenseD435i],
+    args: argparse.Namespace,
+    camera_info: dict[str, Any],
+) -> tuple[RealSenseD435i, dict[str, Any], np.ndarray, np.ndarray, dict]:
+    devices = RealSenseD435i.list_devices()
+    if not devices:
+        raise RuntimeError("没有枚举到 RealSense 相机")
+    current = str((camera_info or {}).get("serial") or getattr(cam, "serial", "") or "").strip()
+    nxt = RealSenseD435i.cycle_listed_device(devices, current)
+    next_serial = str(nxt.get("serial") or "").strip()
+    if not next_serial:
+        raise RuntimeError("下一台相机没有序列号")
+    if next_serial == current and len(devices) == 1:
+        raise RuntimeError(f"只有一台 RealSense: {RealSenseD435i.format_device_label(nxt)}")
+    if cam is not None:
+        cam.close()
+    switch_error = ""
+    try:
+        new_cam = open_camera(
+            args,
+            serial=next_serial,
+            camera_name=str(nxt.get("model") or args.camera_name or "realsense"),
+            camera_mount=args.camera_mount,
+        )
+    except Exception as exc:
+        if not current:
+            raise
+        print(f"[CAMERA][WARN] open {next_serial} failed, reopening {current}: {exc}", file=sys.stderr)
+        new_cam = open_camera(args, serial=current)
+        switch_error = str(exc)
+    info = attach_enumerated_camera_info(new_cam.capture_metadata(), devices)
+    info["available"] = True
+    info["camera_role"] = "enumerated"
+    if switch_error:
+        info["switch_failed"] = switch_error
+    camera_matrix, dist_coeffs, camera_intrinsics = live_intrinsics_from_camera(new_cam)
+    print_enumerated_cameras(devices, str(info.get("serial") or ""))
+    if switch_error:
+        print(f"[CAMERA] stayed on {info['label']} after failed switch: {switch_error}")
+    else:
+        print(f"[CAMERA] switched to {info['label']}")
+    return new_cam, info, camera_matrix, dist_coeffs, camera_intrinsics
+
+
 def build_camera_candidates(args: argparse.Namespace) -> list[dict[str, str]]:
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
@@ -991,16 +1138,40 @@ def open_camera(
 
 def try_open_camera(args: argparse.Namespace) -> tuple[Optional[RealSenseD435i], dict, Optional[str]]:
     if args.arm_only:
-        return None, {"source": "arm_only", "available": False}, None
+        return None, {"source": "arm_only", "available": False, "enumerated": []}, None
 
-    candidates = build_camera_candidates(args) if args.cam_fallback else [
-        {
-            "serial": (args.cam_serial or DEFAULT_WRIST_CAM_SERIAL).strip(),
-            "camera_name": args.camera_name.strip() or "right_hand_d435",
-            "camera_mount": args.camera_mount.strip() or "wrist",
-            "role": "primary",
-        }
-    ]
+    devices = RealSenseD435i.list_devices()
+    print_enumerated_cameras(devices, (args.cam_serial or "").strip())
+    requested = (args.cam_serial or "").strip()
+    if devices:
+        ordered = list(devices)
+        if requested:
+            match = next((item for item in devices if str(item.get("serial") or "") == requested), None)
+            if match is not None:
+                ordered = [match] + [item for item in devices if item is not match]
+        candidates = [
+            {
+                "serial": str(item.get("serial") or ""),
+                "camera_name": str(item.get("model") or args.camera_name or "realsense"),
+                "camera_mount": args.camera_mount.strip() or "wrist",
+                "role": "enumerated",
+            }
+            for item in ordered
+            if str(item.get("serial") or "").strip()
+        ]
+        if args.cam_fallback:
+            for extra in build_camera_candidates(args):
+                if extra["serial"] not in {item["serial"] for item in candidates}:
+                    candidates.append(extra)
+    else:
+        candidates = build_camera_candidates(args) if args.cam_fallback else [
+            {
+                "serial": requested or DEFAULT_WRIST_CAM_SERIAL,
+                "camera_name": args.camera_name.strip() or "right_hand_d435",
+                "camera_mount": args.camera_mount.strip() or "wrist",
+                "role": "primary",
+            }
+        ]
     errors: list[str] = []
     for index, profile in enumerate(candidates):
         serial = profile["serial"]
@@ -1011,11 +1182,12 @@ def try_open_camera(args: argparse.Namespace) -> tuple[Optional[RealSenseD435i],
                 camera_name=profile["camera_name"],
                 camera_mount=profile["camera_mount"],
             )
-            info = cam.capture_metadata()
+            info = attach_enumerated_camera_info(cam.capture_metadata(), devices)
             info["available"] = True
             info["fallback_index"] = index
             info["camera_role"] = profile["role"]
             info["selected_serial"] = serial
+            print(f"[CAMERA] current {info.get('label', serial)}")
             if index == 0:
                 print(f"[CAMERA] opened primary ({profile['role']}) serial={serial} name={profile['camera_name']}")
             else:
@@ -1175,6 +1347,11 @@ def _process_arm_web_command_impl(
         print(f"[ARM] {prefix}: {arm_random_deltas}")
         msg = execute_arm_motion(
             controller, target_q, args, prefix, arm_session, start_q=current_q, loop_control=loop_control
+        )
+        return msg, arm_waypoint_index, arm_random_deltas, arm_random_clamped
+    if web_command == "arm_random_sweep":
+        msg, arm_random_deltas, arm_random_clamped = run_random_upper_arm_sweep(
+            controller, arm_session, args, arm_joint_limits, loop_control
         )
         return msg, arm_waypoint_index, arm_random_deltas, arm_random_clamped
     if web_command in {"arm_joint_delta", "arm_joint_abs", "arm_joint_random"}:
@@ -1918,6 +2095,8 @@ def run_capture(args: argparse.Namespace) -> int:
         last_corners = None
         last_detected = False
         last_detect_method = "none"
+        last_detect_ts = 0.0
+        last_gray = None
         fetch_timeout_ms = min(200, args.timeout_ms) if stream_server is not None else args.timeout_ms
 
         while True:
@@ -1970,15 +2149,28 @@ def run_capture(args: argparse.Namespace) -> int:
                     frame_bgr = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
                     preview = gamma_correct_bgr(frame_bgr, args.gamma)
                     gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-                    corners, detect_method = find_chessboard_corners(gray, pattern_size, args.gamma)
-                    detected = corners is not None
+                    last_gray = gray
                     vis = preview.copy()
-                    if detected:
+                    now = time.monotonic()
+                    if preview_detect_due(last_detect_ts, last_detected, now):
+                        corners, detect_method = find_chessboard_corners(
+                            gray,
+                            pattern_size,
+                            args.gamma,
+                            mode="preview",
+                        )
+                        detected = corners is not None
+                        last_detect_ts = now
+                        last_detected = detected
+                        last_detect_method = detect_method
+                        last_corners = corners
+                    else:
+                        detected = last_detected
+                        detect_method = last_detect_method
+                        corners = last_corners
+                    if detected and corners is not None:
                         cv2.drawChessboardCorners(vis, pattern_size, corners, True)
                     last_vis = vis.copy()
-                    last_detected = detected
-                    last_detect_method = detect_method
-                    last_corners = corners
             else:
                 vis = make_no_camera_placeholder(
                     args.width,
@@ -2002,16 +2194,24 @@ def run_capture(args: argparse.Namespace) -> int:
                 except Exception as exc:
                     print(f"[PREVIEW][PNP][WARN] {exc}", file=sys.stderr)
 
+            cam_label = str((camera_info or {}).get("label") or "camera=?")
+            cam_slot = ""
+            if camera_info:
+                count = int(camera_info.get("device_count") or 0)
+                index = int(camera_info.get("device_index") or 0)
+                if count:
+                    cam_slot = f"  ({index + 1}/{count})"
+            put_text_bgr_adaptive(vis, f"{cam_label}{cam_slot}", (10, 30), 0.72)
             put_text_bgr_adaptive(
                 vis,
                 f"mode={mode} cam={'on' if camera_available else 'off'} chessboard={int(detected)} saved={saved_count}",
-                (10, 30),
-                0.72,
+                (10, 60),
+                0.62,
             )
             put_text_bgr_adaptive(
                 vis,
                 f"board={args.cols}x{args.rows} square={args.square_mm:g}mm hand_frame={args.hand_frame}",
-                (10, 60),
+                (10, 90),
                 0.6,
             )
             rms_text = "live_rms=--"
@@ -2021,13 +2221,13 @@ def run_capture(args: argparse.Namespace) -> int:
                     f"live_rms={live_target_rms:.3f}px "
                     f"limit={args.capture_max_reproj_rms_px:.3f}px {rms_status}"
                 )
-            put_text_bgr_adaptive(vis, rms_text, (10, 90), 0.65)
+            put_text_bgr_adaptive(vis, rms_text, (10, 120), 0.65)
             if camera_available:
-                put_text_bgr_adaptive(vis, "SPACE=capture  ENTER/S=solve  ESC/q=quit", (10, 120), 0.6)
+                put_text_bgr_adaptive(vis, "SPACE=save  ENTER/S=solve  Next Camera on web  ESC/q=quit", (10, 150), 0.58)
             else:
-                put_text_bgr_adaptive(vis, "ARM DEBUG: joint buttons only  ESC/q=quit", (10, 120), 0.6)
-            if last_msg and time.monotonic() - last_msg_ts < 3.0:
-                put_text_bgr_adaptive(vis, last_msg, (10, 150), 0.6)
+                put_text_bgr_adaptive(vis, "ARM DEBUG: joint buttons only  ESC/q=quit", (10, 150), 0.6)
+            if last_msg:
+                put_text_bgr_adaptive(vis, last_msg, (10, 180), 0.58)
             if camera_available and not args.headless:
                 cv2.imshow(win, vis)
             if stream_server is not None:
@@ -2142,6 +2342,22 @@ def run_capture(args: argparse.Namespace) -> int:
                     print(f"[TEST][ERROR] {exc}", file=sys.stderr)
                 last_msg_ts = time.monotonic()
                 continue
+            if web_command == "next_camera" or key in (ord("n"), ord("N")):
+                try:
+                    cam, camera_info, camera_matrix, dist_coeffs, camera_intrinsics = switch_to_next_realsense(
+                        cam, args, camera_info
+                    )
+                    camera_available = cam is not None
+                    last_vis = None
+                    if camera_info.get("switch_failed"):
+                        last_msg = f"next camera failed, now {camera_info.get('label')}"
+                    else:
+                        last_msg = f"switched to {camera_info.get('label')}"
+                except Exception as exc:
+                    last_msg = f"next camera failed: {exc}"
+                    print(f"[CAMERA][ERROR] {exc}", file=sys.stderr)
+                last_msg_ts = time.monotonic()
+                continue
             if web_command == "start_calib":
                 last_msg = "manual calib mode: external controller + Save/Solve (no auto motion)"
                 last_msg_ts = time.monotonic()
@@ -2234,17 +2450,41 @@ def run_capture(args: argparse.Namespace) -> int:
                 if not camera_available:
                     time.sleep(0.02)
                 continue
-
             if arm_debug_mode:
                 last_msg = "capture rejected: arm debug mode (no camera)"
                 last_msg_ts = time.monotonic()
                 print("[CAPTURE] 拒绝：当前为无相机调试模式")
                 continue
 
+            if corners is None and last_gray is not None:
+                corners, detect_method = find_chessboard_corners(
+                    last_gray,
+                    pattern_size,
+                    args.gamma,
+                    mode="full",
+                )
+                detected = corners is not None
+                last_detected = detected
+                last_detect_method = detect_method
+                last_corners = corners
+                last_detect_ts = time.monotonic()
+            print(
+                f"[CAPTURE] Save requested chessboard={int(detected)} "
+                f"rms={live_target_rms} command={web_command}"
+            )
             if corners is None:
-                last_msg = "capture rejected: no chessboard"
+                warning_seq += 1
+                last_msg = (
+                    f"capture rejected: no chessboard "
+                    f"(need {args.cols}x{args.rows} inner corners)"
+                )
+                last_warning = {
+                    "id": warning_seq,
+                    "kind": "capture_rejected_no_board",
+                    "message": last_msg,
+                }
                 last_msg_ts = time.monotonic()
-                print("[CAPTURE] 拒绝：当前画面未检测到棋盘格")
+                print(f"[CAPTURE] 拒绝：未检出 {args.cols}x{args.rows} 棋盘，画面上要看到绿角点再 Save")
                 continue
 
             try:
@@ -2253,16 +2493,23 @@ def run_capture(args: argparse.Namespace) -> int:
                     image_host_ts = float(
                         frame_metadata.get("host_monotonic_sec", time.monotonic())
                     )
-                    capture_fk_state = fk_provider.snapshot(
-                        target_host_monotonic_sec=image_host_ts,
-                        max_sync_delta_sec=args.fk_sync_max_delta_sec,
-                        max_state_age_sec=args.fk_max_state_age_sec,
-                        max_joint_velocity_rad_s=(
-                            None
-                            if args.capture_max_joint_velocity_rad_s == 0.0
-                            else args.capture_max_joint_velocity_rad_s
-                        ),
-                    )
+                    try:
+                        capture_fk_state = fk_provider.snapshot(
+                            target_host_monotonic_sec=image_host_ts,
+                            max_sync_delta_sec=args.fk_sync_max_delta_sec,
+                            max_state_age_sec=args.fk_max_state_age_sec,
+                            max_joint_velocity_rad_s=(
+                                None
+                                if args.capture_max_joint_velocity_rad_s == 0.0
+                                else args.capture_max_joint_velocity_rad_s
+                            ),
+                        )
+                    except Exception as fk_exc:
+                        if args.strict_capture:
+                            raise
+                        print(f"[CAPTURE][WARN] FK 同步失败，预览仍用最新 FK 保存: {fk_exc}")
+                        capture_fk_state = fk_provider.snapshot()
+                        capture_fk_state["preview_fk_warning"] = str(fk_exc)
                     if args.strict_capture:
                         validate_live_fk_snapshot(
                             capture_fk_state,
@@ -2311,21 +2558,24 @@ def run_capture(args: argparse.Namespace) -> int:
                     target_tvec = live_target_tvec
                     target_rms = live_target_rms
                 if target_rms > args.capture_max_reproj_rms_px:
-                    warning_seq += 1
                     last_msg = (
-                        f"capture rejected: pnp_rms={target_rms:.3f}px "
+                        f"pnp_rms={target_rms:.3f}px "
                         f"> {args.capture_max_reproj_rms_px:.3f}px"
                     )
-                    last_warning = {
-                        "id": warning_seq,
-                        "kind": "capture_rejected_high_reprojection",
-                        "message": last_msg,
-                        "target_reprojection_rms_px": float(target_rms),
-                        "max_reprojection_rms_px": float(args.capture_max_reproj_rms_px),
-                    }
-                    last_msg_ts = time.monotonic()
-                    print(f"[CAPTURE][WARN] {last_msg}")
-                    continue
+                    if args.strict_capture:
+                        warning_seq += 1
+                        last_warning = {
+                            "id": warning_seq,
+                            "kind": "capture_rejected_high_reprojection",
+                            "message": f"capture rejected: {last_msg}",
+                            "target_reprojection_rms_px": float(target_rms),
+                            "max_reprojection_rms_px": float(args.capture_max_reproj_rms_px),
+                        }
+                        last_msg = f"capture rejected: {last_msg}"
+                        last_msg_ts = time.monotonic()
+                        print(f"[CAPTURE][WARN] {last_msg}")
+                        continue
+                    print(f"[CAPTURE][WARN] 预览模式仍保存：{last_msg}")
                 image_path = save_capture_record(
                     out_dir=session_dir,
                     image_bgr=frame_bgr,
@@ -2378,7 +2628,13 @@ def run_capture(args: argparse.Namespace) -> int:
                     },
                 )
             except Exception as exc:
+                warning_seq += 1
                 last_msg = f"capture failed: {exc}"
+                last_warning = {
+                    "id": warning_seq,
+                    "kind": "capture_failed",
+                    "message": last_msg,
+                }
                 last_msg_ts = time.monotonic()
                 print(f"[CAPTURE][ERROR] {exc}", file=sys.stderr)
                 continue
@@ -2409,12 +2665,12 @@ def parse_args() -> argparse.Namespace:
         help="标定板所在手臂；决定默认 hand frame 和 FK targets（默认 right）",
     )
     parser.add_argument("--cam-index", type=int, default=0)
-    parser.add_argument("--cam-serial", type=str, default="", help=f"主相机序列号，默认腕部 D435 ({DEFAULT_WRIST_CAM_SERIAL})")
+    parser.add_argument("--cam-serial", type=str, default="", help="主相机序列号。留空则按 --cam-index，或在网页用 Next Camera 选择")
     parser.add_argument(
         "--cam-serial-fallback",
         type=str,
         default="",
-        help=f"主相机失败后尝试的序列号，默认头部 D435I ({DEFAULT_HEAD_CAM_SERIAL})",
+        help="主相机失败后尝试的序列号。留空则不使用固定备用序列号",
     )
     parser.add_argument("--cam-fallback", dest="cam_fallback", action="store_true", default=True, help="腕部->头部->无相机 顺序尝试（默认开启）")
     parser.add_argument("--no-cam-fallback", dest="cam_fallback", action="store_false", help="只尝试主相机，不自动切换头部/无相机")
@@ -2578,6 +2834,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arm-random-max-delta-rad", type=float, default=0.08, help="兼容旧参数：未设置分组幅度时作为肩肘随机幅度")
     parser.add_argument("--arm-random-shoulder-elbow-max-delta-rad", type=float, default=None, help="Random Right Arm 肩/肘关节最大随机扰动")
     parser.add_argument("--arm-random-wrist-max-delta-rad", type=float, default=0.18, help="Random Right Arm 手腕关节最大随机扰动")
+    parser.add_argument("--arm-random-sweep-count", type=int, default=25, help="网页 Random Sweep 的上臂随机可达位姿数")
+    parser.add_argument(
+        "--arm-random-sweep-include-wrist",
+        action="store_true",
+        help="Random Sweep 同时扰动手腕；默认只动肩肘（上臂）",
+    )
     parser.add_argument("--arm-limit-margin-rad", type=float, default=0.03, help="按 URDF joint limit clamp 时预留的安全边界")
     parser.add_argument("--arm-kp", type=float, default=60.0)
     parser.add_argument("--arm-kd", type=float, default=1.5)
@@ -2655,6 +2917,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--arm-random-shoulder-elbow-max-delta-rad 必须 > 0")
     if args.arm_random_wrist_max_delta_rad <= 0:
         parser.error("--arm-random-wrist-max-delta-rad 必须 > 0")
+    if args.arm_random_sweep_count < 8 or args.arm_random_sweep_count > 40:
+        parser.error("--arm-random-sweep-count 必须在 8~40")
     if args.arm_limit_margin_rad < 0:
         parser.error("--arm-limit-margin-rad 必须 >= 0")
     if args.arm_kp < 0 or args.arm_kd < 0:

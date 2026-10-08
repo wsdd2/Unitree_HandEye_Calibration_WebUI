@@ -34,6 +34,14 @@ def gamma_correct_bgr(image_bgr: np.ndarray, gamma: float) -> np.ndarray:
     return cv2.LUT(image_bgr, table)
 
 
+PREVIEW_DETECT_MAX_SIDE = 640
+PREVIEW_MISS_PERIOD_S = 0.20
+PREVIEW_HIT_PERIOD_S = 0.05
+PREVIEW_TILE_COVERAGE = 0.62
+PREVIEW_TILE_SCALE = 2.0
+PREVIEW_TILE_MIN_EDGE = 1.0
+
+
 def gray_variants(gray: np.ndarray, gamma: float) -> list[tuple[str, np.ndarray]]:
     table = np.array([(i / 255.0) ** gamma * 255.0 for i in range(256)], dtype=np.uint8) # Its principle is to adjust the brightness of the image
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) # This is used for improving the contrast of the image
@@ -45,30 +53,144 @@ def gray_variants(gray: np.ndarray, gamma: float) -> list[tuple[str, np.ndarray]
     ]
 
 
+def preview_gray_variants(gray: np.ndarray, gamma: float) -> list[tuple[str, np.ndarray]]:
+    variants = [("raw", gray)]
+    if abs(gamma - 1.0) > 1e-6:
+        table = np.array([(i / 255.0) ** gamma * 255.0 for i in range(256)], dtype=np.uint8)
+        variants.append(("gamma", cv2.LUT(gray, table)))
+    return variants
+
+
+def preview_detect_due(last_ts: float, last_hit: bool, now: Optional[float] = None) -> bool:
+    """True when the live preview should run another cheap chessboard search."""
+    stamp = time.monotonic() if now is None else now
+    period = PREVIEW_HIT_PERIOD_S if last_hit else PREVIEW_MISS_PERIOD_S
+    return stamp - last_ts >= period
+
+
+def _downscale_gray(gray: np.ndarray, max_side: int = PREVIEW_DETECT_MAX_SIDE) -> tuple[np.ndarray, float]:
+    height, width = gray.shape[:2]
+    longest = max(height, width)
+    if longest <= max_side:
+        return gray, 1.0
+    scale = max_side / float(longest)
+    small = cv2.resize(
+        gray,
+        (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+        interpolation=cv2.INTER_AREA,
+    )
+    return small, scale
+
+
+def _scale_corners(corners: np.ndarray, scale: float) -> np.ndarray:
+    out = np.asarray(corners, dtype=np.float32)
+    if scale == 1.0:
+        return out
+    out = out.copy()
+    out[..., :2] /= scale
+    return out
+
+
+def _offset_corners(corners: np.ndarray, origin_xy: tuple[int, int]) -> np.ndarray:
+    ox, oy = origin_xy
+    if ox == 0 and oy == 0:
+        return corners
+    out = np.asarray(corners, dtype=np.float32).copy()
+    out[..., 0] += float(ox)
+    out[..., 1] += float(oy)
+    return out
+
+
+def _preview_tiles(height: int, width: int) -> list[tuple[int, int, int, int]]:
+    """Overlapping crops so a board sitting in a corner is not shrunk away."""
+    tile_h = max(32, int(round(height * PREVIEW_TILE_COVERAGE)))
+    tile_w = max(32, int(round(width * PREVIEW_TILE_COVERAGE)))
+    if tile_h >= height and tile_w >= width:
+        return []
+    ys = (0, max(0, height - tile_h))
+    xs = (0, max(0, width - tile_w))
+    tiles: list[tuple[int, int, int, int]] = []
+    for y0 in ys:
+        for x0 in xs:
+            tile = (y0, y0 + tile_h, x0, x0 + tile_w)
+            if tile not in tiles:
+                tiles.append(tile)
+    return tiles
+
+
+def _mean_abs_laplacian(gray: np.ndarray) -> float:
+    lap = cv2.Laplacian(gray, cv2.CV_16S, ksize=3)
+    return float(np.mean(np.abs(lap)))
+
+
 def find_chessboard_corners(
     gray: np.ndarray,
     pattern_size: tuple[int, int],
     gamma: float = 0.85,
+    *,
+    mode: str = "full",
 ) -> tuple[Optional[np.ndarray], str]:
+    """Detect inner corners.
+
+    ``mode="preview"`` first tries a downscaled FAST_CHECK so an empty scene
+    stays cheap. If that misses, it searches overlapping full-resolution tiles
+    enlarged 2x, which is what finds a small board parked in a corner.
+    ``mode="full"`` keeps the thorough search for Save / offline.
+    """
+    kind = (mode or "full").strip().lower()
+    if kind not in {"full", "preview"}:
+        raise ValueError(f"unsupported chessboard detect mode: {mode}")
+
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
     classic_flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
-    sb_flags = cv2.CALIB_CB_NORMALIZE_IMAGE
-    sb_flags |= int(getattr(cv2, "CALIB_CB_EXHAUSTIVE", 0))
-    sb_flags |= int(getattr(cv2, "CALIB_CB_ACCURACY", 0))
+    classic_flags += int(getattr(cv2, "CALIB_CB_FAST_CHECK", 0))
+    if kind == "preview":
+        work, scale = _downscale_gray(gray)
+        variants = preview_gray_variants(work, gamma)
+        use_sb = False
+        refine_gray = gray
+    else:
+        work, scale = gray, 1.0
+        variants = gray_variants(work, gamma)
+        use_sb = True
+        refine_gray = gray
+        sb_flags = cv2.CALIB_CB_NORMALIZE_IMAGE
+        sb_flags |= int(getattr(cv2, "CALIB_CB_EXHAUSTIVE", 0))
+        sb_flags |= int(getattr(cv2, "CALIB_CB_ACCURACY", 0))
 
-    for variant_name, candidate in gray_variants(gray, gamma):
+    def accept(corners: np.ndarray, found_scale: float, origin_xy: tuple[int, int], label: str):
+        mapped = _offset_corners(_scale_corners(corners, found_scale), origin_xy)
+        refined = cv2.cornerSubPix(refine_gray, mapped, (11, 11), (-1, -1), criteria)
+        return refined, label
+
+    for variant_name, candidate in variants:
         ok, corners = cv2.findChessboardCorners(candidate, pattern_size, flags=classic_flags)
         if ok and corners is not None:
-            corners = corners.astype(np.float32)
-            refined = cv2.cornerSubPix(candidate, corners, (11, 11), (-1, -1), criteria)
-            return refined, f"{variant_name}/classic"
+            return accept(corners, scale, (0, 0), f"{variant_name}/classic")
 
-        if hasattr(cv2, "findChessboardCornersSB"):
+        if use_sb and hasattr(cv2, "findChessboardCornersSB"):
             ok, corners = cv2.findChessboardCornersSB(candidate, pattern_size, flags=sb_flags)
             if ok and corners is not None:
-                corners = corners.astype(np.float32)
-                refined = cv2.cornerSubPix(candidate, corners, (11, 11), (-1, -1), criteria)
-                return refined, f"{variant_name}/sb"
+                return accept(corners, scale, (0, 0), f"{variant_name}/sb")
+
+    if kind != "preview":
+        return None, ""
+
+    height, width = gray.shape[:2]
+    for y0, y1, x0, x1 in _preview_tiles(height, width):
+        crop = gray[y0:y1, x0:x1]
+        if crop.size == 0 or _mean_abs_laplacian(crop) < PREVIEW_TILE_MIN_EDGE:
+            continue
+        enlarged = cv2.resize(
+            crop,
+            None,
+            fx=PREVIEW_TILE_SCALE,
+            fy=PREVIEW_TILE_SCALE,
+            interpolation=cv2.INTER_LINEAR,
+        )
+        ok, corners = cv2.findChessboardCorners(enlarged, pattern_size, flags=classic_flags)
+        if ok and corners is not None:
+            return accept(corners, PREVIEW_TILE_SCALE, (x0, y0), "tile/classic")
 
     return None, ""
 
@@ -117,6 +239,43 @@ def save_chessboard_image(image_bgr: np.ndarray, output_dir: Path, task: str, ca
     return path
 
 
+def camera_overlay_text(cam) -> tuple[str, dict]:
+    info = dict(cam.capture_metadata()) if hasattr(cam, "capture_metadata") else {}
+    try:
+        devices = RealSenseD435i.list_devices()
+    except Exception:
+        devices = []
+    serial = str(info.get("serial") or getattr(cam, "serial", "") or "").strip()
+    info["enumerated"] = devices
+    info["device_count"] = len(devices)
+    info["device_index"] = next(
+        (index for index, item in enumerate(devices) if str(item.get("serial") or "") == serial),
+        0,
+    )
+    for item in devices:
+        if str(item.get("serial") or "") == serial:
+            info["model"] = item.get("model") or info.get("model") or "RealSense"
+            info["serial"] = serial
+            break
+    info.setdefault("model", "RealSense")
+    info.setdefault("serial", serial or "?")
+    info["label"] = RealSenseD435i.format_device_label(info)
+    slot = f"  ({info['device_index'] + 1}/{info['device_count']})" if info["device_count"] else ""
+    return f"{info['label']}{slot}", info
+
+
+def switch_preview_camera(cam, args: argparse.Namespace):
+    if args.camera_backend != "realsense":
+        raise RuntimeError("Next Camera 仅支持 RealSense 后端")
+    devices = RealSenseD435i.list_devices()
+    current = str(getattr(cam, "serial", "") or "").strip()
+    nxt = RealSenseD435i.cycle_listed_device(devices, current)
+    cam.close()
+    args.cam_serial = str(nxt.get("serial") or "")
+    args.cam_index = int(nxt.get("index") or 0)
+    return open_camera(args)
+
+
 def draw_preview_overlay(
     vis: np.ndarray,
     *,
@@ -128,14 +287,16 @@ def draw_preview_overlay(
     output_dir: Path,
     last_msg: str,
     last_msg_ts: float,
+    camera_line: str = "",
 ) -> None:
     status = "YES" if detected else "NO"
-    put_text_bgr_adaptive(vis, f"task={task} chessboard={status} pattern={pattern_size[0]}x{pattern_size[1]}", (10, 30), 0.72)
-    put_text_bgr_adaptive(vis, f"method={detect_method or '-'} saved={saved_count}", (10, 60), 0.62)
-    put_text_bgr_adaptive(vis, f"output={output_dir}", (10, 90), 0.55)
-    put_text_bgr_adaptive(vis, "SPACE=save detected image  ESC/q=quit", (10, 120), 0.62)
+    put_text_bgr_adaptive(vis, camera_line or "camera=?", (10, 30), 0.72)
+    put_text_bgr_adaptive(vis, f"task={task} chessboard={status} pattern={pattern_size[0]}x{pattern_size[1]}", (10, 60), 0.62)
+    put_text_bgr_adaptive(vis, f"method={detect_method or '-'} saved={saved_count}", (10, 90), 0.62)
+    put_text_bgr_adaptive(vis, f"output={output_dir}", (10, 120), 0.55)
+    put_text_bgr_adaptive(vis, "SPACE=save  Next Camera on web  ESC/q=quit", (10, 150), 0.58)
     if last_msg and time.monotonic() - last_msg_ts < 3.0:
-        put_text_bgr_adaptive(vis, last_msg, (10, 150), 0.62)
+        put_text_bgr_adaptive(vis, last_msg, (10, 180), 0.62)
 
 
 def open_camera(args: argparse.Namespace):
@@ -192,6 +353,10 @@ def run_preview(args: argparse.Namespace) -> int:
     saved_count = len(list(output_dir.glob("*.jpg"))) if output_dir.exists() else 0
     last_msg = ""
     last_msg_ts = 0.0
+    last_detect_ts = 0.0
+    last_detected = False
+    last_detect_method = "none"
+    last_corners = None
     stream_server = None
     if args.stream_debug:
         stream_server = DebugStreamServer(
@@ -221,12 +386,28 @@ def run_preview(args: argparse.Namespace) -> int:
             frame_bgr = cv2.cvtColor(frame["rgb"], cv2.COLOR_RGB2BGR)
             preview = gamma_correct_bgr(frame_bgr, args.gamma)
             gray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
-            corners, detect_method = find_chessboard_corners(gray, pattern_size, args.gamma)
-            detected = corners is not None
+            now = time.monotonic()
+            if preview_detect_due(last_detect_ts, last_detected, now):
+                corners, detect_method = find_chessboard_corners(
+                    gray,
+                    pattern_size,
+                    args.gamma,
+                    mode="preview",
+                )
+                detected = corners is not None
+                last_detect_ts = now
+                last_detected = detected
+                last_detect_method = detect_method
+                last_corners = corners
+            else:
+                corners = last_corners
+                detect_method = last_detect_method
+                detected = last_detected
 
             vis = preview.copy()
             if detected:
                 cv2.drawChessboardCorners(vis, pattern_size, corners, True)
+            camera_line, camera_info = camera_overlay_text(cam)
             draw_preview_overlay(
                 vis,
                 task=args.task,
@@ -237,6 +418,7 @@ def run_preview(args: argparse.Namespace) -> int:
                 output_dir=output_dir,
                 last_msg=last_msg,
                 last_msg_ts=last_msg_ts,
+                camera_line=camera_line,
             )
             if not args.headless:
                 cv2.imshow(win, vis)
@@ -251,6 +433,7 @@ def run_preview(args: argparse.Namespace) -> int:
                         "saved_count": saved_count,
                         "output_dir": str(output_dir.resolve()),
                         "last_message": last_msg,
+                        "camera": camera_info,
                     }
                 )
 
@@ -258,11 +441,33 @@ def run_preview(args: argparse.Namespace) -> int:
             web_command = DebugStreamServer.command_name(
                 stream_server.pop_command() if stream_server is not None else None
             )
+            if web_command == "next_camera" or key in (ord("n"), ord("N")):
+                try:
+                    cam = switch_preview_camera(cam, args)
+                    last_msg = f"switched to {camera_overlay_text(cam)[0]}"
+                    print(f"[CAMERA] {last_msg}")
+                except Exception as exc:
+                    last_msg = f"next camera failed: {exc}"
+                    print(f"[CAMERA][ERROR] {exc}", file=sys.stderr)
+                last_msg_ts = time.monotonic()
+                continue
             if key in (27, ord("q"), ord("Q")) or web_command == "quit":
                 break
             save_requested = key == ord(" ") or web_command == "save"
             if not save_requested:
                 continue
+            if not detected:
+                corners, detect_method = find_chessboard_corners(
+                    gray,
+                    pattern_size,
+                    args.gamma,
+                    mode="full",
+                )
+                detected = corners is not None
+                last_detected = detected
+                last_detect_method = detect_method
+                last_corners = corners
+                last_detect_ts = time.monotonic()
             if not detected and not args.save_without_board:
                 last_msg = "save rejected: no chessboard"
                 last_msg_ts = time.monotonic()
