@@ -53,9 +53,15 @@ WORKSPACE_ROOT = PROJECT_ROOT.parent
 DEFAULT_DATA_ROOT = PROJECT_ROOT / "data"
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs"
 DEFAULT_ARM_PRESETS_JSON = PROJECT_ROOT / "data" / "arm_presets.json"
-DEFAULT_WRIST_CAM_SERIAL = ""
-DEFAULT_HEAD_CAM_SERIAL = ""
-DEFAULT_FK_URDF = PROJECT_ROOT / "robots" / "h2" / "H2.urdf"
+DEFAULT_WRIST_CAM_SERIAL = "349622074791"
+DEFAULT_HEAD_CAM_SERIAL = "254322072703"
+DEFAULT_FK_URDF = (
+    WORKSPACE_ROOT
+    / "unitree_ros"
+    / "robots"
+    / "h2_description"
+    / "H2.urdf"
+)
 DEFAULT_ARM_SIDE = "right"
 DEFAULT_BASE_FRAME = "torso_link"
 DEFAULT_HAND_FRAMES = {
@@ -1527,11 +1533,20 @@ class FKStateProvider:
                 max_age_sec=max_state_age_sec,
             )
         else:
+            # The synchronized sample intentionally belongs to the image time.
+            # Chessboard/PnP processing may take hundreds of milliseconds, so
+            # comparing that historical sample with "now" falsely labels a
+            # perfectly synchronized state as stale. wait_for_state() above
+            # already gates the freshness of the live DDS/ROS source; here we
+            # only gate image-to-state synchronization.
             timed_state = self._bridge.nearest_state(
                 target_host_monotonic_sec,
                 max_delta_sec=max_sync_delta_sec,
-                max_age_sec=max_state_age_sec,
             )
+        latest_state_age_sec = self._bridge.latest_state_age_sec()
+        matched_state_age_sec = max(
+            0.0, time.monotonic() - timed_state.host_monotonic_sec
+        )
         state_samples = timed_state.joints
         joint_values = {name: sample.q for name, sample in state_samples.items()}
         joint_velocities = {name: sample.dq for name, sample in state_samples.items()}
@@ -1590,9 +1605,12 @@ class FKStateProvider:
                 "image_host_monotonic_sec": target_host_monotonic_sec,
                 "lowstate_host_monotonic_sec": timed_state.host_monotonic_sec,
                 "sync_delta_sec": sync_delta_sec,
-                "state_age_sec_at_snapshot": max(
-                    0.0, time.monotonic() - timed_state.host_monotonic_sec
+                "state_age_sec_at_snapshot": (
+                    matched_state_age_sec
+                    if latest_state_age_sec is None
+                    else float(latest_state_age_sec)
                 ),
+                "matched_state_age_sec_at_snapshot": matched_state_age_sec,
             },
             "model": {
                 "urdf_path": str(self._urdf_path),
@@ -2665,12 +2683,12 @@ def parse_args() -> argparse.Namespace:
         help="标定板所在手臂；决定默认 hand frame 和 FK targets（默认 right）",
     )
     parser.add_argument("--cam-index", type=int, default=0)
-    parser.add_argument("--cam-serial", type=str, default="", help="主相机序列号。留空则按 --cam-index，或在网页用 Next Camera 选择")
+    parser.add_argument("--cam-serial", type=str, default="", help=f"主相机序列号，默认腕部 D435 ({DEFAULT_WRIST_CAM_SERIAL})")
     parser.add_argument(
         "--cam-serial-fallback",
         type=str,
         default="",
-        help="主相机失败后尝试的序列号。留空则不使用固定备用序列号",
+        help=f"主相机失败后尝试的序列号，默认头部 D435I ({DEFAULT_HEAD_CAM_SERIAL})",
     )
     parser.add_argument("--cam-fallback", dest="cam_fallback", action="store_true", default=True, help="腕部->头部->无相机 顺序尝试（默认开启）")
     parser.add_argument("--no-cam-fallback", dest="cam_fallback", action="store_false", help="只尝试主相机，不自动切换头部/无相机")

@@ -33,14 +33,16 @@ EE_LINK = {
     "right": "right_wrist_yaw_link",
 }
 DEFAULT_URDF_CANDIDATES = (
-    Path(__file__).resolve().parents[1] / "robots" / "h2" / "H2.urdf",
-    Path(__file__).resolve().parents[1] / "robots" / "H2.urdf",
+    Path("/home/unitree/MscapeTech/urdf/H2.urdf"),
+    Path(__file__).resolve().parents[2] / "urdf" / "H2.urdf",
+    Path(__file__).resolve().parents[2] / "unitree_ros" / "robots" / "h2_description" / "H2.urdf",
 )
 
 
 def ensure_robot_kinematics() -> None:
     roots = (
-        Path(__file__).resolve().parents[1] / "robot_kinematics",
+        Path("/home/unitree/MscapeTech/robot_kinematics"),
+        Path(__file__).resolve().parents[2] / "robot_kinematics",
     )
     for root in roots:
         if (root / "pose_to_joint" / "ik_urdf.py").is_file():
@@ -51,7 +53,7 @@ def ensure_robot_kinematics() -> None:
             if fk_dir not in sys.path:
                 sys.path.insert(0, fk_dir)
             return
-    raise RuntimeError("找不到 robot_kinematics。请保留仓库里的 robot_kinematics 目录")
+    raise RuntimeError("找不到 robot_kinematics。请确认已上传到 /home/unitree/MscapeTech/robot_kinematics")
 
 
 def resolve_urdf(path: str = "") -> Path:
@@ -63,7 +65,7 @@ def resolve_urdf(path: str = "") -> Path:
     for candidate in DEFAULT_URDF_CANDIDATES:
         if candidate.is_file():
             return candidate
-    raise RuntimeError("找不到 H2.urdf。用 --urdf 指定，或放到 robots/h2/H2.urdf")
+    raise RuntimeError("找不到 H2.urdf。用 --urdf 指定，或上传到 /home/unitree/MscapeTech/urdf/H2.urdf")
 
 
 def _rpy_from_matrix(matrix: Sequence[Sequence[float]]) -> tuple[float, float, float]:

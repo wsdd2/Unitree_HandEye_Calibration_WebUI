@@ -8,7 +8,13 @@ from typing import Any, Optional
 import cv2
 from flask import Flask, Response, jsonify, make_response, request
 
-from handeye_calib.sweep_web import SWEEP_QUEUE_MAX, SWEEP_STALE_SEC, normalize_sweep_command
+from handeye_calib.sweep_web import (
+    SWEEP_JOG_COMMANDS,
+    SWEEP_JOINT_COMMANDS,
+    SWEEP_QUEUE_MAX,
+    SWEEP_STALE_SEC,
+    normalize_sweep_command,
+)
 
 
 RIGHT_ARM_JOINT_UI = [
@@ -82,33 +88,66 @@ SWEEP_PANEL_HTML = """
       <div class="hint">平移是躯干系：Z+ 向上抬（默认 20 mm），X/Y 默认 2 mm。旋转仍是相机系。当前 <span id="sweep-step">XY 2.0 mm / Z 20.0 mm / 2.0°</span></div>
       <div class="jog-grid">
         <span class="jog-label">X</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_x_plus', this)">X+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_x_minus', this)">X-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_x_plus" disabled>X+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_x_minus" disabled>X-</button>
         <span class="jog-label">Y</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_y_plus', this)">Y+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_y_minus', this)">Y-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_y_plus" disabled>Y+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_y_minus" disabled>Y-</button>
         <span class="jog-label">Z</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_z_plus', this)">Z+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_z_minus', this)">Z-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_z_plus" disabled>Z+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_z_minus" disabled>Z-</button>
         <span class="jog-label">roll</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_roll_plus', this)">R+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_roll_minus', this)">R-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_roll_plus" disabled>R+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_roll_minus" disabled>R-</button>
         <span class="jog-label">pitch</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_pitch_plus', this)">P+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_pitch_minus', this)">P-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_pitch_plus" disabled>P+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_pitch_minus" disabled>P-</button>
         <span class="jog-label">yaw</span>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_yaw_plus', this)">Y+</button>
-        <button class="arm" data-sweep disabled onclick="sendSweep('sweep_yaw_minus', this)">Y-</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_yaw_plus" disabled>Y+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_yaw_minus" disabled>Y-</button>
       </div>
       <div class="controls">
         <button class="mode" data-sweep disabled onclick="sendSweep('sweep_step_halve', this)">步长 /2</button>
         <button class="mode" data-sweep disabled onclick="sendSweep('sweep_step_double', this)">步长 ×2</button>
         <button class="test" data-sweep disabled onclick="sendSweep('sweep_follow', this)">跟随实测</button>
       </div>
+      <h3>右臂关节平滑微调</h3>
+      <div class="hint">沿用运控关节限位；单击走一步，按住连续走。当前 <span id="sweep-joint-step">2.0°</span></div>
+      <div class="jog-grid">
+        <span class="jog-label">肩 pitch</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_1_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_1_minus" disabled>−</button>
+        <span class="jog-label">肩 roll</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_2_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_2_minus" disabled>−</button>
+        <span class="jog-label">肩 yaw</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_3_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_3_minus" disabled>−</button>
+        <span class="jog-label">肘</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_4_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_4_minus" disabled>−</button>
+        <span class="jog-label">腕 roll</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_5_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_5_minus" disabled>−</button>
+        <span class="jog-label">腕 pitch</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_6_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_6_minus" disabled>−</button>
+        <span class="jog-label">腕 yaw</span>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_7_plus" disabled>+</button>
+        <button class="arm" data-sweep data-sweep-jog="sweep_joint_7_minus" disabled>−</button>
+      </div>
+      <div class="controls">
+        <button class="mode" data-sweep disabled onclick="sendSweep('sweep_joint_step_halve', this)">关节步长 /2</button>
+        <button class="mode" data-sweep disabled onclick="sendSweep('sweep_joint_step_double', this)">关节步长 ×2</button>
+      </div>
+      <div class="hint" id="sweep-joint-state"></div>
       </div>
 """
 
 SWEEP_PANEL_JS = """
+    let sweepHoldDelay = null;
+    let sweepHoldRepeat = null;
+
     async function sendSweep(command, btn) {
       if (btn && btn.disabled) return;
       pulseButton(btn);
@@ -128,10 +167,45 @@ SWEEP_PANEL_JS = """
       refreshState();
     }
 
+    function stopSweepHold() {
+      if (sweepHoldDelay !== null) window.clearTimeout(sweepHoldDelay);
+      if (sweepHoldRepeat !== null) window.clearInterval(sweepHoldRepeat);
+      sweepHoldDelay = null;
+      sweepHoldRepeat = null;
+    }
+
+    function startSweepHold(event, btn) {
+      if (!btn || btn.disabled) return;
+      event.preventDefault();
+      stopSweepHold();
+      const command = btn.dataset.sweepJog;
+      sendSweep(command, btn);
+      sweepHoldDelay = window.setTimeout(() => {
+        sweepHoldRepeat = window.setInterval(() => {
+          if (!btn.disabled) sendSweep(command, btn);
+        }, 450);
+      }, 420);
+    }
+
+    function bindSweepJogControls() {
+      document.querySelectorAll('[data-sweep-jog]').forEach((btn) => {
+        btn.addEventListener('pointerdown', (event) => startSweepHold(event, btn));
+        btn.addEventListener('pointerup', stopSweepHold);
+        btn.addEventListener('pointercancel', stopSweepHold);
+        btn.addEventListener('pointerleave', stopSweepHold);
+        btn.addEventListener('contextmenu', (event) => event.preventDefault());
+      });
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) stopSweepHold();
+      });
+    }
+
     function refreshSweepUi(sweep) {
       const statusEl = document.getElementById('sweep-status');
       const panel = document.getElementById('sweep-panel');
       const stepEl = document.getElementById('sweep-step');
+      const jointStepEl = document.getElementById('sweep-joint-step');
+      const jointStateEl = document.getElementById('sweep-joint-state');
       sweep = sweep || {};
       const connected = !!sweep.connected;
       const ready = !!sweep.accepts_input;
@@ -157,6 +231,16 @@ SWEEP_PANEL_JS = """
           'XY ' + Number(sweep.step_mm).toFixed(1) +
           ' mm / Z ' + Number(sweep.z_step_mm || 20).toFixed(1) +
           ' mm / ' + Number(sweep.rot_deg || 2).toFixed(1) + '°';
+      }
+      if (jointStepEl) {
+        jointStepEl.textContent = Number(sweep.joint_step_deg || 2).toFixed(1) + '°';
+      }
+      if (jointStateEl) {
+        const names = ['肩P', '肩R', '肩Y', '肘', '腕R', '腕P', '腕Y'];
+        const values = Array.isArray(sweep.joint_deg) ? sweep.joint_deg : [];
+        jointStateEl.textContent = values.length === 7
+          ? names.map((name, index) => name + ' ' + Number(values[index]).toFixed(1) + '°').join('  ')
+          : '';
       }
     }
 """
@@ -604,6 +688,7 @@ class DebugStreamServer:
     }}
 
     bindButtonPressFeedback();
+    bindSweepJogControls();
     setInterval(refreshState, 500);
     refreshState();
   </script>
@@ -654,6 +739,16 @@ class DebugStreamServer:
                     return jsonify({"ok": False, "error": "sweep client not connected"}), 409
                 if not bool(self._sweep_status.get("accepts_input")):
                     return jsonify({"ok": False, "error": "sweep not accepting input yet"}), 409
+                motion_commands = set(SWEEP_JOG_COMMANDS) | set(SWEEP_JOINT_COMMANDS)
+                if cmd in motion_commands:
+                    # A held web button may post faster than a quintic/service
+                    # move can finish. Keep only the newest pending jog so the
+                    # arm stops promptly when the user releases the button.
+                    self._sweep_commands = [
+                        pending
+                        for pending in self._sweep_commands
+                        if pending not in motion_commands
+                    ]
                 if len(self._sweep_commands) >= SWEEP_QUEUE_MAX:
                     return jsonify({"ok": False, "error": "sweep command queue full"}), 429
                 self._sweep_commands.append(cmd)
@@ -768,8 +863,10 @@ class DebugStreamServer:
             "step_mm": _as_float(status.get("step_mm"), 2.0),
             "z_step_mm": _as_float(status.get("z_step_mm"), 20.0),
             "rot_deg": _as_float(status.get("rot_deg"), 2.0),
+            "joint_step_deg": _as_float(status.get("joint_step_deg"), 2.0),
             "xyz": status.get("xyz"),
             "rpy_deg": status.get("rpy_deg"),
+            "joint_deg": status.get("joint_deg"),
             "message": str(status.get("message") or ""),
             "queued": len(self._sweep_commands),
         }

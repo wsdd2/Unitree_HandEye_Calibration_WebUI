@@ -36,14 +36,44 @@ SWEEP_JOG_COMMANDS = {
     "sweep_yaw_plus": ("rpy", 2, 1.0),
     "sweep_yaw_minus": ("rpy", 2, -1.0),
 }
+RIGHT_ARM_JOINT_NAMES = (
+    "shoulder_pitch",
+    "shoulder_roll",
+    "shoulder_yaw",
+    "elbow",
+    "wrist_roll",
+    "wrist_pitch",
+    "wrist_yaw",
+)
+RIGHT_ARM_JOINT_LIMITS_RAD = (
+    (-2.618, 1.833),
+    (-2.494, 0.517),
+    (-2.618, 2.618),
+    (-0.986, 3.071),
+    (-2.618, 2.618),
+    (-0.576, 0.576),
+    (-1.22, 1.22),
+)
+SWEEP_JOINT_COMMANDS = {
+    f"sweep_joint_{index + 1}_{direction}": (index, 1.0 if direction == "plus" else -1.0)
+    for index in range(7)
+    for direction in ("plus", "minus")
+}
 SWEEP_META_COMMANDS = frozenset(
     {
         "sweep_step_halve",
         "sweep_step_double",
+        "sweep_joint_step_halve",
+        "sweep_joint_step_double",
         "sweep_follow",
     }
 )
-SWEEP_COMMANDS = SWEEP_MENU_COMMANDS | set(SWEEP_JOG_COMMANDS) | SWEEP_META_COMMANDS
+SWEEP_COMMANDS = (
+    SWEEP_MENU_COMMANDS
+    | set(SWEEP_JOG_COMMANDS)
+    | set(SWEEP_JOINT_COMMANDS)
+    | SWEEP_META_COMMANDS
+)
 
 KEY_TO_SWEEP = {
     "n": "sweep_next",
@@ -168,35 +198,73 @@ def apply_sweep_command(
     control_dt: float,
     log: Callable[[str], None] = print,
     z_step_m: float = 0.02,
-) -> tuple[Optional[str], float, float]:
+    joint_step_deg: float = 2.0,
+) -> tuple[Optional[str], float, float, float]:
     """Run one web/keyboard command. Menu actions return next/skip/quit/stay."""
     cmd = normalize_sweep_command(command)
     if cmd is None:
-        return None, step_m, z_step_m
+        return None, step_m, z_step_m, joint_step_deg
     if cmd in MENU_ACTIONS:
-        return MENU_ACTIONS[cmd], step_m, z_step_m
+        return MENU_ACTIONS[cmd], step_m, z_step_m, joint_step_deg
     if cmd == "sweep_step_halve":
         step_m = max(0.002, step_m / 2.0)
         z_step_m = max(0.005, z_step_m / 2.0)
         log(f"[CART] 步长 XY {step_m * 1000:.1f} mm  Z {z_step_m * 1000:.1f} mm")
-        return None, step_m, z_step_m
+        return None, step_m, z_step_m, joint_step_deg
     if cmd == "sweep_step_double":
         step_m = min(0.02, step_m * 2.0)
         z_step_m = min(0.04, z_step_m * 2.0)
         log(f"[CART] 步长 XY {step_m * 1000:.1f} mm  Z {z_step_m * 1000:.1f} mm")
-        return None, step_m, z_step_m
-    if controller is None or ik is None:
+        return None, step_m, z_step_m, joint_step_deg
+    if cmd == "sweep_joint_step_halve":
+        joint_step_deg = max(0.5, joint_step_deg / 2.0)
+        log(f"[JOINT] 右臂关节步长 {joint_step_deg:.1f}°")
+        return None, step_m, z_step_m, joint_step_deg
+    if cmd == "sweep_joint_step_double":
+        joint_step_deg = min(10.0, joint_step_deg * 2.0)
+        log(f"[JOINT] 右臂关节步长 {joint_step_deg:.1f}°")
+        return None, step_m, z_step_m, joint_step_deg
+    if controller is None:
+        log("[JOINT] 微调需要可用的手臂控制器")
+        return None, step_m, z_step_m, joint_step_deg
+
+    joint_spec = SWEEP_JOINT_COMMANDS.get(cmd)
+    if joint_spec is not None:
+        index, sign = joint_spec
+        q_rad = _commanded_or_measured(controller, arm)
+        if q_rad is None or len(q_rad) != 7:
+            log("[JOINT] 没有可用的右臂目标；请先执行平举")
+            return None, step_m, z_step_m, joint_step_deg
+        q_new = list(q_rad)
+        lower, upper = RIGHT_ARM_JOINT_LIMITS_RAD[index]
+        q_new[index] = max(
+            lower,
+            min(upper, q_new[index] + sign * math.radians(joint_step_deg)),
+        )
+        duration = max(0.35, min(0.9, 0.25 + joint_step_deg * 0.065))
+        _move_arm_smooth(controller, arm, q_new, duration, control_dt)
+        log(
+            f"[JOINT] {RIGHT_ARM_JOINT_NAMES[index]} "
+            f"{math.degrees(q_rad[index]):.1f}° → {math.degrees(q_new[index]):.1f}° "
+            f"({duration:.2f}s quintic)"
+        )
+        return None, step_m, z_step_m, joint_step_deg
+
+    if ik is None:
         log("[CART] 微调需要 --backend sdk 且能加载 H2.urdf / robot_kinematics")
-        return None, step_m, z_step_m
+        return None, step_m, z_step_m, joint_step_deg
     if cmd == "sweep_follow":
         q_rad = controller.measured_arm_rad(arm)
+        if not q_rad:
+            log("[CART] 当前后端没有实测关节反馈，继续沿用最后下发目标")
+            return None, step_m, z_step_m, joint_step_deg
         xyz, rpy = ik.fk_xyz_rpy(q_rad)
         log(f"[CART] 跟随实测 xyz={[round(v, 4) for v in xyz]}")
-        return None, step_m, z_step_m
+        return None, step_m, z_step_m, joint_step_deg
 
     spec = SWEEP_JOG_COMMANDS.get(cmd)
     if spec is None:
-        return None, step_m, z_step_m
+        return None, step_m, z_step_m, joint_step_deg
     kind, axis, sign = spec
     dxyz = [0.0, 0.0, 0.0]
     drpy = [0.0, 0.0, 0.0]
@@ -205,11 +273,10 @@ def apply_sweep_command(
         dxyz[axis] = sign * (z_step_m if use_z else step_m)
     else:
         drpy[axis] = sign * math.radians(rot_deg)
-    q_rad = None
-    if hasattr(controller, "commanded_arm_rad"):
-        q_rad = controller.commanded_arm_rad(arm)
+    q_rad = _commanded_or_measured(controller, arm)
     if q_rad is None:
-        q_rad = controller.measured_arm_rad(arm)
+        log("[CART] 没有可用的手臂目标；请先执行平举")
+        return None, step_m, z_step_m, joint_step_deg
     xyz0, _ = ik.fk_xyz_rpy(q_rad)
     q_new, ok, pos_err, ori_err = ik.apply_delta(q_rad, dxyz, drpy)
     xyz1, _ = ik.fk_xyz_rpy(q_new)
@@ -226,30 +293,68 @@ def apply_sweep_command(
         )
     if not ok:
         log(f"[CART] IK 拒绝 pos_err={pos_err * 1000:.1f}mm ori_err={ori_err:.3f}")
-        return None, step_m, z_step_m
-    controller.apply_arm_rad(arm, q_new, seconds=0.55 if use_z else move_s, dt=control_dt)
+        return None, step_m, z_step_m, joint_step_deg
+    _move_arm_smooth(
+        controller,
+        arm,
+        q_new,
+        0.55 if use_z else move_s,
+        control_dt,
+    )
     xyz, rpy = ik.fk_xyz_rpy(q_new)
     log(
         f"[CART] xyz={[round(v, 4) for v in xyz]} "
         f"rpy_deg={[round(math.degrees(v), 1) for v in rpy]} "
         f"q_deg={[round(math.degrees(v), 1) for v in q_new]}"
     )
-    return None, step_m, z_step_m
+    return None, step_m, z_step_m, joint_step_deg
+
+
+def _commanded_or_measured(controller: Any, arm: str) -> Optional[list[float]]:
+    q_rad = None
+    if hasattr(controller, "commanded_arm_rad"):
+        q_rad = controller.commanded_arm_rad(arm)
+    if q_rad is None and hasattr(controller, "measured_arm_rad"):
+        measured = controller.measured_arm_rad(arm)
+        q_rad = measured or None
+    return None if q_rad is None else [float(value) for value in q_rad]
+
+
+def _move_arm_smooth(
+    controller: Any,
+    arm: str,
+    target_rad: list[float],
+    seconds: float,
+    control_dt: float,
+) -> None:
+    if hasattr(controller, "play_quintic_arm_rad"):
+        controller.play_quintic_arm_rad(
+            arm,
+            target_rad,
+            seconds=seconds,
+            dt=control_dt,
+        )
+        return
+    controller.apply_arm_rad(
+        arm,
+        target_rad,
+        seconds=seconds,
+        dt=control_dt,
+    )
 
 
 def current_ee_status(controller: Any, ik: Any, arm: str) -> dict[str, Any]:
     if controller is None or ik is None:
         return {}
     try:
-        q_rad = None
-        if hasattr(controller, "commanded_arm_rad"):
-            q_rad = controller.commanded_arm_rad(arm)
+        q_rad = _commanded_or_measured(controller, arm)
         if q_rad is None:
-            q_rad = controller.measured_arm_rad(arm)
+            return {}
         xyz, rpy = ik.fk_xyz_rpy(q_rad)
     except Exception:
         return {}
     return {
         "xyz": [round(float(v), 4) for v in xyz],
         "rpy_deg": [round(math.degrees(float(v)), 2) for v in rpy],
+        "joint_deg": [round(math.degrees(float(v)), 2) for v in q_rad],
     }

@@ -26,7 +26,7 @@ class SweepCommandTests(unittest.TestCase):
         self.assertIsNone(command_from_key("w"))
 
     def test_menu_and_step(self) -> None:
-        action, step, z_step = apply_sweep_command(
+        action, step, z_step, joint_step = apply_sweep_command(
             "sweep_next",
             controller=None,
             ik=None,
@@ -40,7 +40,8 @@ class SweepCommandTests(unittest.TestCase):
         self.assertEqual(action, "next")
         self.assertEqual(step, 0.002)
         self.assertEqual(z_step, 0.02)
-        _, step, z_step = apply_sweep_command(
+        self.assertEqual(joint_step, 2.0)
+        _, step, z_step, joint_step = apply_sweep_command(
             "sweep_step_double",
             controller=None,
             ik=None,
@@ -53,6 +54,20 @@ class SweepCommandTests(unittest.TestCase):
         )
         self.assertAlmostEqual(step, 0.004)
         self.assertAlmostEqual(z_step, 0.04)
+        _, step, z_step, joint_step = apply_sweep_command(
+            "sweep_joint_step_double",
+            controller=None,
+            ik=None,
+            arm="right",
+            step_m=step,
+            rot_deg=2.0,
+            move_s=0.1,
+            control_dt=0.02,
+            z_step_m=z_step,
+            joint_step_deg=joint_step,
+            log=lambda _msg: None,
+        )
+        self.assertEqual(joint_step, 4.0)
 
     def test_jog_calls_ik(self) -> None:
         class FakeIK:
@@ -72,7 +87,7 @@ class SweepCommandTests(unittest.TestCase):
 
         ik = FakeIK()
         ctrl = FakeCtrl()
-        action, step, z_step = apply_sweep_command(
+        action, step, z_step, _joint_step = apply_sweep_command(
             "sweep_x_plus",
             controller=ctrl,
             ik=ik,
@@ -115,6 +130,36 @@ class SweepCommandTests(unittest.TestCase):
         )
         self.assertAlmostEqual(lift.last[1][2], 0.02)
 
+    def test_joint_jog_uses_quintic_and_limits(self) -> None:
+        class FakeCtrl:
+            def __init__(self):
+                self.q = [0.0] * 7
+                self.calls = []
+
+            def commanded_arm_rad(self, arm):
+                return list(self.q)
+
+            def play_quintic_arm_rad(self, arm, q, seconds, dt):
+                self.q = list(q)
+                self.calls.append((arm, list(q), seconds, dt))
+
+        ctrl = FakeCtrl()
+        _action, _step, _z_step, joint_step = apply_sweep_command(
+            "sweep_joint_1_minus",
+            controller=ctrl,
+            ik=None,
+            arm="right",
+            step_m=0.002,
+            rot_deg=2.0,
+            move_s=0.1,
+            control_dt=0.02,
+            joint_step_deg=2.0,
+            log=lambda _msg: None,
+        )
+        self.assertEqual(joint_step, 2.0)
+        self.assertEqual(len(ctrl.calls), 1)
+        self.assertAlmostEqual(ctrl.q[0], -2.0 * 3.141592653589793 / 180.0)
+
 
 class SweepHttpTests(unittest.TestCase):
     def test_buttons_wait_for_terminal_b(self) -> None:
@@ -129,6 +174,8 @@ class SweepHttpTests(unittest.TestCase):
         html = client.get("/").get_data(as_text=True)
         self.assertIn("data-sweep", html)
         self.assertIn("sweep_next", html)
+        self.assertIn("sweep_joint_1_plus", html)
+        self.assertIn("data-sweep-jog", html)
         self.assertIn("等待终端 B 接入", html)
         state = client.get("/state").get_json()
         self.assertFalse(state["sweep"]["connected"])
@@ -150,6 +197,9 @@ class SweepHttpTests(unittest.TestCase):
         )
         ready = client.get("/state").get_json()
         self.assertTrue(ready["sweep"]["accepts_input"])
+        accepted = client.post("/sweep/command", json={"command": "sweep_x_plus"})
+        self.assertEqual(accepted.status_code, 200)
+        # Repeated held-button jogs are coalesced instead of accumulating.
         accepted = client.post("/sweep/command", json={"command": "sweep_x_plus"})
         self.assertEqual(accepted.status_code, 200)
         popped = client.get("/sweep/command").get_json()

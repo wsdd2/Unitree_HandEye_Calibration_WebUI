@@ -11,6 +11,9 @@ from typing import Any, Sequence
 
 
 COMMON_SDK_ROOTS = (
+    Path("/home/unitree/MscapeTech/unitree_sdk2_python"),
+    Path("/home/unitree/MscapeTech/H2_joint_control/H2_joint_cartesian/third_party/unitree_sdk2_python"),
+    Path("/home/unitree/MscapeTech/H2_joint_cartesian/third_party/unitree_sdk2_python"),
     Path("/home/unitree/unitree_sdk2_python"),
     Path("/home/unitree/unitree_sdk2/python"),
     Path("/home/unitree/h2/unitree_sdk2_python"),
@@ -22,6 +25,7 @@ def _sdk_search_roots() -> list[Path]:
     here = Path(__file__).resolve()
     roots = [
         here.parents[2] / "unitree_sdk2_python",
+        here.parents[2] / "H2_joint_control" / "H2_joint_cartesian" / "third_party" / "unitree_sdk2_python",
         here.parents[1] / "third_party" / "unitree_sdk2_python",
         *COMMON_SDK_ROOTS,
     ]
@@ -106,7 +110,8 @@ def ensure_unitree_sdk2py() -> None:
             f"  实际报错: {exc}\n"
             f"  已存在的 SDK 目录: {existing or '无'}\n"
             "  在 H2 上应使用:\n"
-            "    export PYTHONPATH=<unitree_sdk2_python目录>:$PYTHONPATH\n"
+            "    export PYTHONPATH=/home/unitree/.local/lib/python3.10/site-packages:"
+            "/usr/lib/python3/dist-packages:/home/unitree/MscapeTech/unitree_sdk2_python:$PYTHONPATH\n"
             "  缺的是 cyclonedds._clayer 时，不要只加 SDK 目录。"
         ) from exc
 
@@ -119,6 +124,72 @@ ALL_ARM_JOINTS = LEFT_ARM_JOINTS + RIGHT_ARM_JOINTS
 HOLD_JOINTS = ALL_ARM_JOINTS
 ARM_JOINTS = {"left": LEFT_ARM_JOINTS, "right": RIGHT_ARM_JOINTS}
 TRACK_RESYNC_RAD = math.radians(12.0)
+# Remote "AI" on this H2 is MotionSwitcher name "ai" and one of these sport FSMs.
+# 703 PhaseWalk is the standing mode CheckMode currently reports alongside name=ai.
+ARM_SDK_READY_FSM = {
+    4: "FixStand",
+    601: "HybridWalk",
+    701: "WalkNew",
+    703: "PhaseWalk",
+}
+ARM_SDK_BLOCKED_FSM = {
+    0: "Invalid",
+    1: "Passive",
+    2: "Protection",
+    3: "Sit",
+    5: "Hybridpassive",
+}
+_SWITCHER: Any = None
+_SWITCHER_LOCK = threading.Lock()
+
+
+def switcher_mode_name(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("name") or "")
+    return ""
+
+
+def _fsm_int(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def arm_sdk_mode_ready(
+    status: int,
+    result: Any,
+    fsm_code: int | None,
+    fsm_id: Any,
+) -> tuple[bool, str]:
+    """True when arm_sdk can move. An empty switcher name is not proof the robot left AI."""
+    name = switcher_mode_name(result)
+    if "ai" in name.lower():
+        return True, name
+    fsm = _fsm_int(fsm_id)
+    # A non-ai name is an explicit other mode. Only a blank/failed CheckMode may use FSM.
+    explicit_other = int(status) == 0 and bool(name)
+    if explicit_other or fsm_code != 0 or fsm not in ARM_SDK_READY_FSM:
+        return False, name
+    label = ARM_SDK_READY_FSM[fsm]
+    return True, f"fsm {fsm} {label}"
+
+
+def motion_switcher_client() -> Any:
+    """One client per process. A new client on every CheckMode leaks DDS readers."""
+    global _SWITCHER
+    with _SWITCHER_LOCK:
+        if _SWITCHER is None:
+            ensure_unitree_sdk2py()
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+
+            client = MotionSwitcherClient()
+            client.SetTimeout(5.0)
+            client.Init()
+            _SWITCHER = client
+        return _SWITCHER
 
 
 class H2ArmSdkController:
@@ -170,12 +241,15 @@ class H2ArmSdkController:
         self._last_q: dict[int, float] | None = None
         self._last_dq: dict[int, float] = {}
         self._weight = 0.0
+        self._aborted = False
         self._state_lock = threading.Lock()
         self._pub_lock = threading.Lock()
         self._servo_stop = threading.Event()
         self._servo_thread: threading.Thread | None = None
         self._servo_dt = 0.02
         self._loco: Any = None
+        self._sub = None
+        self._pub = None
         if iface:
             ChannelFactoryInitialize(int(domain_id), iface)
         else:
@@ -209,28 +283,16 @@ class H2ArmSdkController:
         return client
 
     def motion_mode(self) -> tuple[int, dict[str, Any] | None]:
-        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
-
-        client = MotionSwitcherClient()
-        client.SetTimeout(5.0)
-        client.Init()
-        return client.CheckMode()
+        return motion_switcher_client().CheckMode()
 
     def select_ai_mode(self) -> None:
-        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
-
-        client = MotionSwitcherClient()
-        client.SetTimeout(5.0)
-        client.Init()
-        code, _ = client.SelectMode("ai")
+        code, _ = motion_switcher_client().SelectMode("ai")
         print(f"[SDK] SelectMode(ai) code={code}")
         time.sleep(2.0)
 
-    def print_control_status(self) -> str:
+    def read_control_status(self) -> dict[str, Any]:
         status, result = self.motion_mode()
-        name = ""
-        if isinstance(result, dict):
-            name = str(result.get("name") or "")
+        name = switcher_mode_name(result)
         fsm_code = fsm_id = arm_code = arm_on = None
         try:
             loco = self._loco_client()
@@ -238,24 +300,49 @@ class H2ArmSdkController:
             arm_code, arm_on = loco.GetArmSdkStatus()
         except Exception as exc:
             print(f"[SDK] 读 Loco 状态失败: {exc}")
+        snap = {
+            "status": status,
+            "result": result,
+            "name": name,
+            "fsm_code": fsm_code,
+            "fsm_id": fsm_id,
+            "arm_code": arm_code,
+            "arm_on": arm_on,
+        }
         print(
             f"[SDK] MotionSwitcher={status} {result}  "
             f"fsm=({fsm_code},{fsm_id}) arm_sdk=({arm_code},{arm_on})"
         )
-        return name
+        return snap
+
+    def print_control_status(self) -> str:
+        return str(self.read_control_status()["name"])
 
     def ensure_ai_mode(self, select_ai: bool = False) -> None:
-        name = self.print_control_status()
-        if "ai" not in name.lower():
-            if select_ai:
-                self.select_ai_mode()
-                name = self.print_control_status()
-            if "ai" not in name.lower():
-                raise RuntimeError(
-                    f"当前不在 AI 运控模式（MotionSwitcher={name or '空'}）。"
-                    "请用遥控器切到 AI 并站稳后再跑；不要先 ReleaseMode。"
-                    "若确认要脚本切 AI，加 --select-ai。"
-                )
+        snap = self.read_control_status()
+        ok, why = arm_sdk_mode_ready(snap["status"], snap["result"], snap["fsm_code"], snap["fsm_id"])
+        if not ok and select_ai:
+            self.select_ai_mode()
+            snap = self.read_control_status()
+            ok, why = arm_sdk_mode_ready(
+                snap["status"], snap["result"], snap["fsm_code"], snap["fsm_id"]
+            )
+        if ok:
+            if "ai" not in snap["name"].lower():
+                print(f"[SDK] MotionSwitcher 名称为空，按 {why} 继续抬臂")
+            return
+        fsm = _fsm_int(snap["fsm_id"])
+        fsm_label = ARM_SDK_BLOCKED_FSM.get(fsm, "") if fsm is not None else ""
+        fsm_text = f"{snap['fsm_code']},{snap['fsm_id']}"
+        if fsm_label:
+            fsm_text += f" {fsm_label}"
+        hint = "请用遥控器切到 AI 并站稳后再点 Start；不要先 ReleaseMode。"
+        if not select_ai:
+            hint += "若确认要脚本切 AI，加 --select-ai。"
+        raise RuntimeError(
+            f"当前不在可抬臂的运控状态（MotionSwitcher code={snap['status']} "
+            f"name={snap['name'] or '空'}，fsm=({fsm_text})）。{hint}"
+        )
 
     def enable_arm_sdk(self) -> None:
         try:
@@ -280,12 +367,21 @@ class H2ArmSdkController:
         except Exception as exc:
             print(f"[SDK] DisableArmSDK 失败: {exc}")
 
-    def release_motion_mode(self, retries: int = 3) -> None:
-        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+    def _close_dds(self) -> None:
+        """Drop this controller's readers so the next Raise does not stack them."""
+        for attr in ("_sub", "_pub"):
+            channel = getattr(self, attr, None)
+            setattr(self, attr, None)
+            close = getattr(channel, "Close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:
+                print(f"[SDK] 关闭 {attr} 失败: {exc}")
 
-        client = MotionSwitcherClient()
-        client.SetTimeout(5.0)
-        client.Init()
+    def release_motion_mode(self, retries: int = 3) -> None:
+        client = motion_switcher_client()
         status, result = client.CheckMode()
         print(f"[SDK] MotionSwitcher before: {status} {result}")
         if not isinstance(result, dict) or not result.get("name"):
@@ -339,6 +435,24 @@ class H2ArmSdkController:
         self._servo_thread.start()
         print("[SDK] 50Hz 伺服已开：等到点「结束」之前会一直发 rt/arm_sdk，否则手臂会垂下")
 
+    def abort(self) -> None:
+        """Drop the arms now. In-flight ramps must not publish again."""
+        self._aborted = True
+        self._servo_stop.set()
+        self._servo_thread = None
+        with self._state_lock:
+            last = dict(self._last_q) if self._last_q is not None else None
+            self._weight = 0.0
+            self._last_dq = {}
+        q = last
+        if q is None and self._latest is not None:
+            q = {joint: float(self._latest.motor_state[joint].q) for joint in HOLD_JOINTS}
+        if q:
+            self._publish(q, 0.0, {}, force=True)
+        self.disable_arm_sdk()
+        self._close_dds()
+        print("[SDK] 急停：weight=0，arm_sdk 已关")
+
     def stop_servo(self) -> None:
         self._servo_stop.set()
         thread = self._servo_thread
@@ -388,6 +502,8 @@ class H2ArmSdkController:
             for joint, value in dq.items():
                 velocities[int(joint)] = float(value)
         with self._state_lock:
+            if self._aborted:
+                return
             self._last_q = payload
             self._last_dq = velocities
             self._weight = float(weight)
@@ -398,7 +514,11 @@ class H2ArmSdkController:
         command_q: dict[int, float],
         weight: float,
         dq: dict[int, float] | None = None,
+        *,
+        force: bool = False,
     ) -> None:
+        if self._aborted and not force:
+            return
         with self._pub_lock:
             cmd = self._cmd
             low = self._latest
@@ -543,4 +663,5 @@ class H2ArmSdkController:
             self.write(q, weight=weight)
             time.sleep(dt)
         self.disable_arm_sdk()
+        self._close_dds()
         print("[SDK] arm_sdk weight released")

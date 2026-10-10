@@ -41,19 +41,21 @@ DEFAULT_MULTI_REL = Path("single/multi_joint_points.yaml")
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="自动生成并执行 20~30 个 H2 上臂随机可达关节位姿（默认走 Unitree DDS，不需要 ROS2）"
+        description="自动生成并执行 20~30 个 H2 上臂随机可达关节位姿（默认复用 h2_arm ROS2 运控服务）"
     )
     parser.add_argument("--arm", choices=("right", "left"), default="right")
     parser.add_argument(
         "--backend",
         choices=("sdk", "ros"),
-        default="sdk",
-        help="sdk=本机 rt/arm_sdk（默认，这台机器人没有 ROS 脚本时用这个）；ros=/h2_arm Trigger",
+        default="ros",
+        help="ros=/h2_arm Trigger 五次轨迹（默认）；sdk=本进程直接发布 rt/arm_sdk（备用）",
     )
     parser.add_argument("--iface", default="eth0", help="DDS 网卡，H2 本机通常是 eth0")
     parser.add_argument("--domain-id", type=int, default=0)
     parser.add_argument("--kp", type=float, default=80.0)
     parser.add_argument("--kd", type=float, default=1.5)
+    parser.add_argument("--service-kp", type=float, default=140.0, help="ROS 运控节点关节 KP")
+    parser.add_argument("--service-kd", type=float, default=3.0, help="ROS 运控节点关节 KD")
     parser.add_argument(
         "--no-gravity",
         action="store_true",
@@ -131,7 +133,7 @@ def parse_args() -> argparse.Namespace:
         help="dwell 停稳后自动走下一点，不按键",
     )
     parser.add_argument("--control-dt", type=float, default=0.02)
-    parser.add_argument("--urdf", default="", help="H2 URDF。默认搜 robots/h2/H2.urdf，也可用 --urdf 指定")
+    parser.add_argument("--urdf", default="", help="H2 URDF，键盘 IK 用。默认搜 /home/unitree/MscapeTech/urdf/H2.urdf")
     parser.add_argument("--ee-link", default="", help="末端相机/手 link，默认 right/left_wrist_yaw_link")
     parser.add_argument("--cart-step-mm", type=float, default=2.0, help="网页 X/Y 一步，毫米")
     parser.add_argument("--cart-z-mm", type=float, default=20.0, help="网页 Z+ / Z- 一步，毫米。2 mm 看不出抬手")
@@ -258,7 +260,7 @@ def ensure_arm_service(service: str, timeout_s: float = 8.0) -> None:
         raise RuntimeError(
             f"当前 ROS 域看不到 {service}。\n"
             f"看到的 h2_arm 服务:\n{preview}\n"
-            "这台机器人没有 ROS 脚本，请改用默认 --backend sdk。"
+            "请先启动 h2_arm_service_node，或明确使用备用 --backend sdk。"
         )
     print(f"[ROS2] found {service}")
 
@@ -311,6 +313,24 @@ def connect_sdk(args: argparse.Namespace) -> Any:
     return controller
 
 
+def connect_ros_service(args: argparse.Namespace) -> Any:
+    from handeye_calib.h2_arm_service import H2ArmServiceController
+
+    config_dir = Path(args.config_dir) if args.config_dir else None
+    controller = H2ArmServiceController(
+        config_dir=config_dir,
+        service_joint=args.service_single,
+        kp=args.service_kp,
+        kd=args.service_kd,
+    )
+    print(
+        f"[ROS] h2_arm_service_node config={controller.config_dir} "
+        f"joint_service={controller.service_joint} "
+        f"kp={args.service_kp:.1f} kd={args.service_kd:.1f}"
+    )
+    return controller
+
+
 def run_write(args: argparse.Namespace, poses: list[SweepPose]) -> Path:
     multi_path, _ = install_paths(args)
     text = render_multi_joint_yaml(
@@ -335,9 +355,7 @@ def move_to_pose(
 ) -> None:
     seconds = args.move_duration if duration is None else duration
     print(f"[MOVE] {label} {pose.name} {pose.as_list()}  {seconds:.1f}s")
-    if args.backend == "sdk":
-        if controller is None:
-            raise RuntimeError("sdk backend 需要已连接的 H2ArmSdkController")
+    if controller is not None:
         controller.ramp_arm(args.arm, pose.as_list(), seconds, args.control_dt)
         if args.dwell_s > 0:
             print(f"[DWELL] hold {args.dwell_s:.1f}s，等臂停稳")
@@ -406,6 +424,7 @@ def make_web_client(args: argparse.Namespace) -> SweepWebClient | None:
         step_mm=float(args.cart_step_mm),
         z_step_mm=float(args.cart_z_mm),
         rot_deg=float(args.cart_rot_deg),
+        joint_step_deg=2.0,
         message="正在连接手臂",
     )
     client.start()
@@ -425,6 +444,7 @@ def publish_web_status(
     ik: Any,
     step_m: float,
     z_step_m: float = 0.02,
+    joint_step_deg: float = 2.0,
     message: str = "",
 ) -> None:
     if client is None:
@@ -439,6 +459,7 @@ def publish_web_status(
         step_mm=step_m * 1000.0,
         z_step_mm=z_step_m * 1000.0,
         rot_deg=float(args.cart_rot_deg),
+        joint_step_deg=float(joint_step_deg),
         message=message,
         **extra,
     )
@@ -454,7 +475,8 @@ def wait_after_pose(
     visits: int,
     step_m: float,
     z_step_m: float,
-) -> tuple[str, float, float]:
+    joint_step_deg: float,
+) -> tuple[str, float, float, float]:
     from handeye_calib.ee_keyboard import read_key
 
     goal = "∞" if target <= 0 else str(target)
@@ -473,6 +495,7 @@ def wait_after_pose(
         ik=ik,
         step_m=step_m,
         z_step_m=z_step_m,
+        joint_step_deg=joint_step_deg,
         message="等待网页按钮",
     )
     while True:
@@ -482,7 +505,7 @@ def wait_after_pose(
         if cmd is None:
             time.sleep(0.03)
             continue
-        action, step_m, z_step_m = apply_sweep_command(
+        action, step_m, z_step_m, joint_step_deg = apply_sweep_command(
             cmd,
             controller=controller,
             ik=ik,
@@ -492,6 +515,7 @@ def wait_after_pose(
             move_s=0.35,
             control_dt=args.control_dt,
             z_step_m=z_step_m,
+            joint_step_deg=joint_step_deg,
         )
         publish_web_status(
             client,
@@ -504,6 +528,7 @@ def wait_after_pose(
             ik=ik,
             step_m=step_m,
             z_step_m=z_step_m,
+            joint_step_deg=joint_step_deg,
             message="" if action is None else f"收到 {action}",
         )
         if action in {None, "stay"}:
@@ -519,9 +544,10 @@ def wait_after_pose(
             ik=ik,
             step_m=step_m,
             z_step_m=z_step_m,
+            joint_step_deg=joint_step_deg,
             message=f"执行 {action}",
         )
-        return action, step_m, z_step_m
+        return action, step_m, z_step_m, joint_step_deg
 
 
 def run_dwell(args: argparse.Namespace) -> None:
@@ -532,16 +558,15 @@ def run_dwell(args: argparse.Namespace) -> None:
     visits = 0
     step_m = max(0.002, float(args.cart_step_mm) / 1000.0)
     z_step_m = max(0.005, float(args.cart_z_mm) / 1000.0)
+    joint_step_deg = 2.0
     try:
         if args.backend == "sdk":
             controller = connect_sdk(args)
         else:
-            if not args.install_robot_yaml:
-                print("[WARN] 未加 --install-robot-yaml：/h2_arm/singlearmjoint 仍读机上旧 joint_point.yaml。")
-            ensure_arm_service(args.service_single)
+            controller = connect_ros_service(args)
         sampler = make_sampler(args)
         ik = None
-        if args.backend == "sdk" and controller is not None:
+        if controller is not None:
             try:
                 from handeye_calib.h2_ee_ik import H2CameraIK
 
@@ -566,6 +591,7 @@ def run_dwell(args: argparse.Namespace) -> None:
             ik=ik,
             step_m=step_m,
             z_step_m=z_step_m,
+            joint_step_deg=joint_step_deg,
             message="正在平举",
         )
         move_to_pose(
@@ -577,8 +603,17 @@ def run_dwell(args: argparse.Namespace) -> None:
             duration=args.raise_duration,
         )
         if args.wait_enter:
-            action, step_m, z_step_m = wait_after_pose(
-                args, accepted, target, controller, ik, client, visits, step_m, z_step_m
+            action, step_m, z_step_m, joint_step_deg = wait_after_pose(
+                args,
+                accepted,
+                target,
+                controller,
+                ik,
+                client,
+                visits,
+                step_m,
+                z_step_m,
+                joint_step_deg,
             )
             if action == "quit":
                 print("[DWELL] 平举后结束")
@@ -598,12 +633,22 @@ def run_dwell(args: argparse.Namespace) -> None:
                 ik=ik,
                 step_m=step_m,
                 z_step_m=z_step_m,
+                joint_step_deg=joint_step_deg,
                 message=f"移动 visit {visits}",
             )
             move_to_pose(args, pose, single_path, f"visit {visits} accepted {accepted}/{goal}", controller)
             if args.wait_enter:
-                action, step_m, z_step_m = wait_after_pose(
-                    args, accepted, target, controller, ik, client, visits, step_m, z_step_m
+                action, step_m, z_step_m, joint_step_deg = wait_after_pose(
+                    args,
+                    accepted,
+                    target,
+                    controller,
+                    ik,
+                    client,
+                    visits,
+                    step_m,
+                    z_step_m,
+                    joint_step_deg,
                 )
             else:
                 action = "next"
@@ -623,6 +668,7 @@ def run_dwell(args: argparse.Namespace) -> None:
                 ik=ik,
                 step_m=step_m,
                 z_step_m=z_step_m,
+                joint_step_deg=joint_step_deg,
                 message="回到平举",
             )
             move_to_pose(args, sampler.seed_pose(name="raise"), single_path, "return", controller)
@@ -646,7 +692,10 @@ def main() -> int:
     if args.mode == "write":
         run_write(args, poses)
         print(
-            "只写了 YAML，没有动臂。这台机器人没有 ROS，采图请用 DDS：\n"
+            "只写了 YAML，没有动臂。采图优先复用 ROS 运控服务：\n"
+            "  python3 random_upper_arm_sweep.py --backend ros --mode dwell "
+            "--count 0 --confirm-robot-motion\n"
+            "DDS 直控备用：\n"
             "  python3 random_upper_arm_sweep.py --backend sdk --mode dwell "
             "--count 0 --confirm-robot-motion --iface eth0\n"
             "连续走完不采图：\n"
